@@ -14,15 +14,24 @@
 
 import {
   Badge,
+  Blobatar,
   Button,
   Codicon,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
   EmptyState,
   ErrorState,
+  MessageTextContent,
   PALETTE_AREA,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   ROUTES_AREA,
   RowButton,
   SearchField,
@@ -31,12 +40,14 @@ import {
   SIDEBAR_NAV_AREA,
   Skeleton,
   StatusDot,
+  Textarea,
   Tip,
   atom,
   fmtDateTime,
   host,
   queryClient,
   relativeTime,
+  useMutation,
   useQuery,
   useValue,
   writeClipboardText
@@ -612,6 +623,9 @@ const CSS_TEXT = `
 .pcc-gh-title:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: 2px; border-radius: 3px; }
 .pcc-gh-chip { transition: color 120ms ease, background-color 120ms ease; }
 .pcc-gh-chip:hover, .pcc-gh-chip:focus-visible { color: var(--ui-text-primary); background: var(--chrome-action-hover); outline: none; }
+.pcc-gh-ref { transition: color 120ms ease, background-color 120ms ease; }
+.pcc-gh-ref:hover, .pcc-gh-ref:focus-visible { color: var(--ui-text-primary); background: color-mix(in srgb, var(--ui-stroke-secondary) 65%, transparent); outline: 1px solid var(--ui-accent); outline-offset: 1px; }
+.pcc-gh-back:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: 2px; }
 .pcc-gh-sub-btn:hover, .pcc-gh-sub-btn:focus-visible { background: var(--chrome-action-hover); outline: none; }
 .pcc-gh-linkbtn:hover, .pcc-gh-linkbtn:focus-visible { color: var(--ui-text-secondary); outline: none; }
 @keyframes pcc-gh-flash { from { background: color-mix(in srgb, var(--ui-accent) 14%, transparent); } to { background: transparent; } }
@@ -681,6 +695,19 @@ const S = {
   path: { fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, display: 'block' },
   metrics: { display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.6875rem', color: 'var(--ui-text-secondary)', minWidth: 0, flexWrap: 'wrap' },
   metricMono: { fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-secondary)' },
+  // The identifier row under the path: icon + number pairs, no words. Same size and
+  // muted tone as the chips; the pair is borderless so a column header stays sleek.
+  idRow: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 3, minWidth: 0, flexWrap: 'wrap' },
+  idPair: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 3,
+    fontSize: '0.6875rem',
+    lineHeight: 1.4,
+    color: 'var(--ui-text-secondary)',
+    fontVariantNumeric: 'tabular-nums',
+    whiteSpace: 'nowrap'
+  },
   body: { display: 'flex', flexDirection: 'column', gap: 6, padding: 8 },
   card: {
     position: 'relative',
@@ -1035,15 +1062,6 @@ const S = {
     whiteSpace: 'nowrap',
     color: 'var(--ui-text-quaternary)'
   },
-  ghSub: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 6,
-    flexWrap: 'wrap',
-    minWidth: 0,
-    fontSize: '0.6875rem',
-    color: 'var(--ui-text-tertiary)'
-  },
   ghSubBtn: {
     display: 'flex',
     alignItems: 'center',
@@ -1067,22 +1085,9 @@ const S = {
     whiteSpace: 'nowrap',
     color: 'var(--ui-text-secondary)'
   },
-  ghDetail: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0, padding: '5px 4px 5px 21px' },
-  ghActions: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0, paddingTop: 2 },
   // Issue/PR chips on a board column header, sourced from /board's link rows.
   boardChips: { display: 'inline-flex', alignItems: 'center', gap: 4, minWidth: 0, flexWrap: 'wrap' },
-  ghBody: {
-    fontSize: '0.6875rem',
-    lineHeight: 1.5,
-    color: 'var(--ui-text-secondary)',
-    whiteSpace: 'pre-wrap',
-    wordBreak: 'break-word',
-    overflow: 'hidden',
-    display: '-webkit-box',
-    WebkitLineClamp: 7,
-    WebkitBoxOrient: 'vertical'
-  },
-  ghFiles: { display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', minWidth: 0 },
+  ghFiles: { display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', minWidth: 0 },
   ghFile: {
     maxWidth: 180,
     overflow: 'hidden',
@@ -1095,7 +1100,125 @@ const S = {
     fontSize: '0.625rem',
     fontFamily: 'var(--font-mono, ui-monospace, monospace)'
   },
-  ghReviewRow: { color: 'var(--ui-text-tertiary)' },
+  // ── detail modal ───────────────────────────────────────────────────────────
+  // Same vocabulary as the rows, one step roomier: the dialog already supplies
+  // the surface, the padding and the scroll, so these only lay out content.
+  ghModalHead: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0, textAlign: 'left' },
+  ghModalTitleRow: { display: 'flex', alignItems: 'flex-start', gap: 7, minWidth: 0 },
+  ghModalNum: {
+    flex: 'none',
+    fontSize: '0.75rem',
+    lineHeight: 1.5,
+    color: 'var(--ui-text-quaternary)',
+    fontVariantNumeric: 'tabular-nums',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)'
+  },
+  ghModalTitle: {
+    flex: '1 1 0',
+    minWidth: 0,
+    fontSize: '0.875rem',
+    fontWeight: 600,
+    lineHeight: 1.35,
+    color: 'var(--ui-text-primary)',
+    wordBreak: 'break-word'
+  },
+  ghModalMeta: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    flexWrap: 'wrap',
+    minWidth: 0,
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-tertiary)'
+  },
+  ghBackBtn: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flex: 'none',
+    width: 18,
+    height: 18,
+    padding: 0,
+    border: 0,
+    borderRadius: 4,
+    background: 'transparent',
+    color: 'var(--ui-text-secondary)',
+    cursor: 'pointer'
+  },
+  ghActorRow: { display: 'inline-flex', alignItems: 'center', gap: 4, flex: 'none', minWidth: 0 },
+  ghActor: {
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    fontWeight: 500,
+    color: 'var(--ui-text-secondary)'
+  },
+  ghDiff: { display: 'inline-flex', alignItems: 'center', gap: 5, flex: 'none', fontVariantNumeric: 'tabular-nums' },
+  ghThread: { display: 'flex', flexDirection: 'column', gap: 14, minWidth: 0 },
+  ghSection: { display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 },
+  ghSectionHead: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    fontSize: '0.6875rem',
+    fontWeight: 600,
+    letterSpacing: '0.02em',
+    color: 'var(--ui-text-tertiary)'
+  },
+  // MessageTextContent owns the prose; this only bounds and scales the box.
+  ghProse: { minWidth: 0, fontSize: '0.8125rem' },
+  ghComment: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 6,
+    minWidth: 0,
+    padding: '8px 10px',
+    borderRadius: 8,
+    background: 'color-mix(in srgb, var(--ui-stroke-secondary) 16%, transparent)'
+  },
+  ghCommentHead: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    flexWrap: 'wrap',
+    minWidth: 0,
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-tertiary)'
+  },
+  ghComposer: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+    minWidth: 0,
+    paddingTop: 10,
+    borderTop: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 45%, transparent)'
+  },
+  ghComposerRow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+  ghComposerError: { fontSize: '0.75rem', lineHeight: 1.45, color: 'var(--dt-destructive)' },
+  ghRefChip: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 3,
+    maxWidth: 280,
+    padding: '0 4px',
+    border: 0,
+    borderRadius: 3,
+    background: 'color-mix(in srgb, var(--ui-stroke-secondary) 40%, transparent)',
+    color: 'var(--ui-text-secondary)',
+    lineHeight: 1.4,
+    verticalAlign: 'baseline',
+    cursor: 'pointer',
+    font: 'inherit'
+  },
+  ghRefText: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  ghPop: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0, fontSize: '0.75rem', color: 'var(--ui-text-secondary)' },
+  ghPopHead: { display: 'flex', alignItems: 'center', gap: 5, minWidth: 0, color: 'var(--ui-text-tertiary)' },
+  ghPopKind: { textTransform: 'capitalize' },
+  ghPopNum: { fontFamily: 'var(--font-mono, ui-monospace, monospace)', fontVariantNumeric: 'tabular-nums' },
+  ghPopTitle: { fontWeight: 600, color: 'var(--ui-text-primary)', wordBreak: 'break-word' },
+  ghPopMeta: { display: 'flex', gap: 6, flexWrap: 'wrap', fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)' },
+  ghPopBody: { color: 'var(--ui-text-tertiary)', lineHeight: 1.45, wordBreak: 'break-word' },
   ghGroup: {
     display: 'flex',
     alignItems: 'center',
@@ -1181,20 +1304,79 @@ const S = {
 
 // ── small pieces ─────────────────────────────────────────────────────────────
 
+// The best mark the backend can find for a project folder, asked once per folder
+// and shared between every card that shows it. The stack keys are the backend's
+// contract; the glyph names live here so a wrong name can never break a render.
+const STACK_GLYPH = {
+  laravel: 'server-process',
+  nuxt: 'package',
+  node: 'package',
+  python: 'beaker',
+  rust: 'gear',
+  go: 'rocket',
+  nix: 'file-code',
+  obsidian: 'book',
+  docker: 'layers',
+  docs: 'book',
+  git: 'git-branch'
+}
+
+function useProjectIcon(folder) {
+  const query = useQuery({
+    enabled: Boolean(folder),
+    queryFn: () => ghRest(`/icon?path=${encodeURIComponent(folder)}`).catch(() => null),
+    queryKey: [QUERY_ROOT, 'icon', folder],
+    retry: false,
+    staleTime: 300000
+  })
+
+  return query.data && query.data.ok ? query.data : null
+}
+
+// Layered: the project's own image, then the glyph for what the project is, then
+// the initial block. A loading icon keeps the initial so nothing flashes empty.
 function Avatar({ project, size = 24 }) {
   const color = validColor(project.color)
   const initial = (String(project.label || '?').trim()[0] || '?').toUpperCase()
+  const icon = useProjectIcon(primaryPath(project))
+  const box = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flex: 'none',
+    width: size,
+    height: size,
+    borderRadius: 7,
+    overflow: 'hidden'
+  }
+
+  if (icon && icon.kind === 'image' && icon.data_url) {
+    return jsx('span', {
+      'aria-hidden': 'true',
+      style: { ...box, background: 'var(--ui-bg-quaternary)', border: '1px solid var(--ui-stroke-secondary)' },
+      children: jsx('img', {
+        alt: '',
+        decoding: 'async',
+        src: icon.data_url,
+        style: { height: '100%', width: '100%', objectFit: 'contain' }
+      })
+    })
+  }
+
+  const glyph = icon && icon.kind === 'glyph' ? STACK_GLYPH[String(icon.stack || '')] : ''
+
+  if (glyph) {
+    return jsx('span', {
+      'aria-hidden': 'true',
+      style: { ...box, color: color || 'var(--ui-text-secondary)' },
+      children: jsx(Codicon, { name: glyph, size: `${Math.round(size * 0.64)}px` })
+    })
+  }
 
   return jsx('span', {
     'aria-hidden': 'true',
     style: {
-      display: 'inline-flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      flex: 'none',
-      width: size,
-      height: size,
-      borderRadius: 7,
+      ...box,
       fontSize: size * 0.46,
       fontWeight: 600,
       color: 'var(--ui-text-primary)',
@@ -1414,7 +1596,89 @@ function BoardLinkChips({ links }) {
   })
 }
 
-function ProjectColumn({ project, index, status, liveByStored, onOpenProject, onOpenSession, links }) {
+const NO_COUNTS = {}
+const COUNTS_PATH_LIMIT = 50
+
+// ONE batched read for the whole board: every project's folder, a single
+// /github/counts call. A missing route, a failure or ok:false all collapse to an
+// empty map, so a column simply has no identifier row. The backend caches too.
+function useRepoCounts(projects) {
+  const key = useMemo(() => {
+    const seen = new Set()
+
+    for (const p of projects || []) {
+      const folder = primaryPath(p)
+
+      if (folder) seen.add(folder)
+      if (seen.size >= COUNTS_PATH_LIMIT) break
+    }
+
+    return Array.from(seen).join('\n')
+  }, [projects])
+
+  const query = useQuery({
+    enabled: key !== '',
+    queryFn: () =>
+      ghRest(`/github/counts?${key.split('\n').map(p => `path=${encodeURIComponent(p)}`).join('&')}`).catch(() => null),
+    queryKey: [QUERY_ROOT, 'gh-counts', key],
+    refetchInterval: 60000,
+    retry: false,
+    staleTime: 60000
+  })
+  const data = query.data
+
+  return data && data.ok && data.counts && typeof data.counts === 'object' ? data.counts : NO_COUNTS
+}
+
+function countOf(value) {
+  const n = Number(value)
+
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
+}
+
+function idCount(n) {
+  return n > 999 ? '999+' : String(n)
+}
+
+// Icon + number pairs: open issues, open PRs and, when there is room, the live
+// sessions. A pair with 0 or an unknown count is left out; with nothing to show
+// the whole row is null (live alone never makes a row, it only joins one).
+function ProjectIdRow({ counts, liveCount }) {
+  if (!counts) return null
+  const pairs = [
+    { icon: 'issues', label: 'open', noun: 'issue', value: countOf(counts.issues_open) },
+    { icon: 'git-pull-request', label: 'open', noun: 'pull request', value: countOf(counts.prs_open) }
+  ].filter(pair => pair.value > 0)
+
+  if (pairs.length === 0) return null
+
+  return jsxs('span', {
+    style: S.idRow,
+    children: [
+      ...pairs.map(pair =>
+        jsx(
+          Tip,
+          {
+            label: `${pair.value} ${pair.label} ${pair.noun}${pair.value === 1 ? '' : 's'}`,
+            children: jsxs('span', {
+              style: S.idPair,
+              children: [jsx(Codicon, { name: pair.icon, size: '0.75rem', style: { flex: 'none' } }), idCount(pair.value)]
+            })
+          },
+          pair.icon
+        )
+      ),
+      liveCount > 0
+        ? jsx(Tip, {
+            label: `${liveCount} live ${liveCount === 1 ? 'session' : 'sessions'}`,
+            children: jsxs('span', { style: { ...S.idPair, color: 'var(--ui-accent)' }, children: [jsx(StatusDot, { tone: 'good' }), idCount(liveCount)] })
+          })
+        : null
+    ]
+  })
+}
+
+function ProjectColumn({ project, index, status, liveByStored, onOpenProject, onOpenSession, links, counts }) {
   const recent = recentSessions(project)
   const shown = recent.slice(0, BOARD_CARD_LIMIT)
   const hidden = Math.max(0, (project.sessionCount || 0) - shown.length)
@@ -1446,12 +1710,13 @@ function ProjectColumn({ project, index, status, liveByStored, onOpenProject, on
                 title: `Open ${project.label}`,
                 type: 'button',
                 children: [
-                  jsx(Avatar, { project }),
+                  jsx(Avatar, { project, size: 32 }),
                   jsxs('span', {
                     style: { display: 'flex', flexDirection: 'column', minWidth: 0, gap: 1 },
                     children: [
                       jsx('span', { style: S.name, children: project.label }),
-                      jsx(PathLine, { path: primaryPath(project) })
+                      jsx(PathLine, { path: primaryPath(project) }),
+                      jsx(ProjectIdRow, { counts, liveCount })
                     ]
                   })
                 ]
@@ -1731,8 +1996,14 @@ const GH_PRESETS = [
 const GH_LIMIT = 50
 const SHIPPED_CAP = 20
 const BRANCH_CAP = 25
-const PR_BODY_CHARS = 600
 const PR_FILES_SHOWN = 8
+// #123 references: a chip is only ever drawn for a number /github/refs resolved,
+// so an unresolvable number stays the writer's plain text.
+const GH_REF_RE = /(?<![\w/])#(\d{1,7})\b/g
+const GH_REF_CHARS = 200
+// The backend resolves at most this many numbers per /github/refs read.
+const GH_REF_MAX = 50
+const GH_LABEL_CHIPS = 5
 const CHECKS_TONE = { success: 'good', failure: 'bad', pending: 'warn', none: 'muted' }
 const CHECKS_TEXT = { success: 'all checks passing', failure: 'checks failing', pending: 'checks running', none: 'no checks reported' }
 const REVIEW_BADGES = {
@@ -1761,12 +2032,12 @@ function writeGhPreset(presetId) {
 // ctx.rest rejects when the gateway has no router for this plugin, which is the
 // "backend not enabled yet" signal the section renders. Guarding here keeps the
 // failure a rejected promise instead of a render crash on an older host.
-function ghRest(path) {
+function ghRest(path, opts) {
   if (!pluginCtx || typeof pluginCtx.rest !== 'function') {
     return Promise.reject(new Error('This Desktop build has no plugin REST door.'))
   }
 
-  return pluginCtx.rest(path)
+  return pluginCtx.rest(path, opts)
 }
 
 // A failure is a code, not a status line. Each normal condition gets one small
@@ -2072,7 +2343,7 @@ function GhFileChips({ files }) {
   if (!files || files.length === 0) return null
   const shown = files.slice(0, PR_FILES_SHOWN)
 
-  return jsxs('div', {
+  return jsxs('span', {
     style: S.ghFiles,
     children: [
       ...shown.map(name =>
@@ -2085,88 +2356,640 @@ function GhFileChips({ files }) {
   })
 }
 
-function GhPrDetail({ folder, number, onIssue }) {
+// ── the issue / PR detail modal ─────────────────────────────────────────────
+// A row is the summary; the modal is the conversation. Body, comments and review
+// bodies all go through MessageTextContent, so fences, tables and images render
+// with the app's own pipeline instead of a text approximation. #123 references
+// are resolved in ONE batched /github/refs read per view and decorated into
+// chips that push the next item onto the same stack, so Back is a pop and never
+// a browser back.
+//
+// Every route here can 404 (the Python half may not be running yet): a missing
+// refs route means plain text, a missing write route means the sentence it
+// returned sits above the composer, and the thread still renders from the
+// detail route alone.
+
+const REVIEW_STATES = {
+  APPROVED: { label: 'approved', variant: 'success' },
+  CHANGES_REQUESTED: { label: 'changes requested', variant: 'destructive' },
+  COMMENTED: { label: 'commented', variant: 'muted' },
+  DISMISSED: { label: 'dismissed', variant: 'muted' }
+}
+
+function ghKindWord(kind) {
+  return kind === 'pr' ? 'pull request' : 'issue'
+}
+
+function ghKindGlyph(kind) {
+  return kind === 'pr' ? 'git-pull-request' : 'issues'
+}
+
+function ghStateTone(state) {
+  return String(state || '').toLowerCase() === 'open' ? 'good' : 'muted'
+}
+
+function ghWhen(value) {
+  const ms = ghMs(value)
+
+  return ms ? fmtDateTime.format(new Date(ms)) : ''
+}
+
+function ghReviewView(state) {
+  const key = String(state || '').toUpperCase()
+
+  return REVIEW_STATES[key] || { label: key ? key.toLowerCase() : 'reviewed', variant: 'muted' }
+}
+
+// One scan of a body: a fresh regex per call, because a shared /g regex carries
+// `lastIndex` as state and a view scans several bodies inside one render.
+function ghRefScan(text) {
+  const source = String(text || '')
+  const re = new RegExp(GH_REF_RE.source, 'g')
+  const out = []
+  let hit = re.exec(source)
+
+  while (hit) {
+    out.push({ end: re.lastIndex, index: hit.index, number: Number(hit[1]) })
+    hit = re.exec(source)
+  }
+
+  return out
+}
+
+// Every #number in a body, oldest sort first, de-duplicated: one `numbers=` for
+// the whole view, so the modal makes one refs request and not one per body.
+// Capped at the backend's own refs limit so the query string stays bounded.
+function ghRefNumbers(texts) {
+  const seen = new Set()
+
+  for (const text of texts || []) {
+    for (const hit of ghRefScan(text)) {
+      if (hit.number > 0) seen.add(hit.number)
+    }
+  }
+
+  return [...seen].sort((a, b) => a - b).slice(0, GH_REF_MAX)
+}
+
+function ghFlat(text, limit = GH_REF_CHARS) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim()
+
+  return flat.length > limit ? `${flat.slice(0, limit).trimEnd()}…` : flat
+}
+
+// decorateText hands back the rendered inline children of p/li/td, so a code
+// span or a fenced block arrives already built and is passed through untouched.
+// Only a string child is split, and only a number refs resolved becomes a chip.
+function ghDecorateRefs(children, refs, onOpen, folder) {
+  const split = text => {
+    const out = []
+    let last = 0
+
+    for (const hit of ghRefScan(text)) {
+      const entry = refs ? refs[String(hit.number)] : null
+
+      if (!entry) continue
+      if (hit.index > last) out.push(text.slice(last, hit.index))
+      out.push(jsx(GhRefChip, { entry, folder, onOpen }, `ref-${hit.number}-${hit.index}`))
+      last = hit.end
+    }
+
+    if (last === 0) return text
+    if (last < text.length) out.push(text.slice(last))
+
+    return out
+  }
+
+  const walk = node => {
+    if (typeof node === 'string') return split(node)
+    if (Array.isArray(node)) return node.map(child => walk(child))
+
+    return node
+  }
+
+  return walk(children)
+}
+
+// A write route answers {ok:false, code, error}; a rejected request is folded
+// into the same shape so the composer has exactly one sentence to show.
+function ghWriteFailure(res, fallback) {
+  const sentence = String((res && (res.error || res.detail)) || '').trim()
+
+  return sentence || fallback
+}
+
+function ghReason(res) {
+  const err = res && res.error
+
+  return err && err.message ? err.message : String(err || 'the request failed')
+}
+
+// One chip: '#123 · Title', a state dot and an issue/PR glyph. Hover opens a
+// popover (the pointer needs a grace period to cross the gap to it), and a click
+// pushes that item onto the modal's stack.
+function GhRefChip({ entry, folder, onOpen }) {
+  const [open, setOpen] = useState(false)
+  const grace = useRef(0)
+  const kind = entry.kind === 'pr' ? 'pr' : 'issue'
+  const number = Number(entry.number) || 0
+  const title = String(entry.title || '')
+  // The refs payload carries no body, so the hover card reads the same detail
+  // endpoint the modal does — only while it is open, and cached with it.
   const query = useQuery({
-    enabled: Boolean(folder),
-    queryKey: [QUERY_ROOT, 'github', 'pr', folder, number],
-    queryFn: () => ghRest(`/github/pr/${number}?path=${encodeURIComponent(folder)}`),
+    enabled: open && Boolean(folder) && number > 0,
+    queryKey: [QUERY_ROOT, 'github', kind, folder, number],
+    queryFn: () => ghRest(`/github/${kind}/${number}?path=${encodeURIComponent(folder)}`),
     retry: false,
     staleTime: 60000
   })
+  const body = query.data && !query.data.error ? ghFlat(query.data.body) : ''
+  const enter = () => {
+    grace.current += 1
+    setOpen(true)
+  }
+  const leave = () => {
+    const at = grace.current + 1
 
-  if (query.isLoading) {
-    return jsxs('div', {
-      style: S.ghDetail,
-      children: [
-        jsx(Skeleton, { style: { height: 10, width: '78%' } }),
-        jsx(Skeleton, { style: { height: 10, width: '52%' } })
-      ]
-    })
+    grace.current = at
+    schedule(() => {
+      if (grace.current === at) setOpen(false)
+    }, 160)
   }
 
-  const pr = query.data
+  return jsxs(Popover, {
+    onOpenChange: next => (next ? enter() : setOpen(false)),
+    open,
+    children: [
+      jsx(PopoverTrigger, {
+        asChild: true,
+        children: jsxs('button', {
+          className: 'pcc-gh-ref',
+          onClick: event => {
+            event.preventDefault()
+            event.stopPropagation()
+            setOpen(false)
+            onOpen(kind, number)
+          },
+          onMouseEnter: enter,
+          onMouseLeave: leave,
+          style: S.ghRefChip,
+          title: `${ghNumber(number)} ${title}`,
+          type: 'button',
+          children: [
+            jsx(StatusDot, { tone: ghStateTone(entry.state) }),
+            jsx(Codicon, { name: ghKindGlyph(kind), size: '0.625rem', style: { flex: 'none' } }),
+            jsx('span', { style: S.ghRefText, children: `${ghNumber(number)} · ${title || ghKindWord(kind)}` })
+          ]
+        })
+      }),
+      jsx(PopoverContent, {
+        align: 'start',
+        side: 'top',
+        children: jsxs('div', {
+          onMouseEnter: enter,
+          onMouseLeave: leave,
+          style: S.ghPop,
+          children: [
+            jsxs('div', {
+              style: S.ghPopHead,
+              children: [
+                jsx(Codicon, { name: ghKindGlyph(kind), size: '0.6875rem', style: { flex: 'none' } }),
+                jsx('span', { style: S.ghPopKind, children: ghKindWord(kind) }),
+                jsx('span', { style: S.ghPopNum, children: ghNumber(number) }),
+                jsx(Badge, {
+                  children: String(entry.state || '').toLowerCase() === 'closed' ? 'closed' : 'open',
+                  size: 'xs',
+                  variant: ghStateTone(entry.state) === 'good' ? 'success' : 'muted'
+                })
+              ]
+            }),
+            jsx('div', { style: S.ghPopTitle, children: title || 'Untitled' }),
+            jsxs('div', {
+              style: S.ghPopMeta,
+              children: [
+                entry.author ? jsx('span', { children: entry.author }) : null,
+                entry.updated_at ? jsx('span', { children: `updated ${ghAgo(entry.updated_at)}` }) : null
+              ]
+            }),
+            body ? jsx('div', { style: S.ghPopBody, children: body }) : null,
+            jsx(Button, {
+              onClick: () => {
+                setOpen(false)
+                onOpen(kind, number)
+              },
+              size: 'xs',
+              variant: 'outline',
+              children: 'Open'
+            })
+          ]
+        })
+      })
+    ]
+  })
+}
 
-  if (query.isError) return jsx('div', { style: S.ghQuiet, children: 'Could not load this pull request.' })
-  if (pr && ((pr.code && pr.code !== 'ok') || pr.error)) return jsx(GhFailure, { data: pr, folder })
-  if (!pr) return jsx('div', { style: S.ghQuiet, children: 'No detail for this pull request.' })
+function GhMiniAvatar({ login }) {
+  const name = String(login || 'ghost')
 
-  const body = String(pr.body || '').slice(0, PR_BODY_CHARS)
-  const files = pr.files_changed || []
-  const reviews = pr.reviews || []
-  const linked = pr.linked_issues || []
+  return jsx(Blobatar, { name, size: 16, title: name })
+}
+
+function GhComment({ comment, decorate }) {
+  const at = ghAgo(comment.created_at)
 
   return jsxs('div', {
-    style: S.ghDetail,
+    style: S.ghComment,
     children: [
-      body ? jsx('div', { style: S.ghBody, children: body }) : jsx('div', { style: S.ghQuiet, children: 'No description.' }),
       jsxs('div', {
-        style: S.ghSub,
+        style: S.ghCommentHead,
         children: [
-          jsx(Codicon, { name: 'files', size: '0.75rem', style: { flex: 'none', color: 'var(--ui-text-quaternary)' } }),
-          jsx('span', {
-            children: `${files.length} changed ${files.length === 1 ? 'file' : 'files'}${
-              pr.comments_count ? `, ${pr.comments_count} ${pr.comments_count === 1 ? 'comment' : 'comments'}` : ''
-            }`
-          }),
-          jsx(GhFileChips, { files })
+          jsx(GhMiniAvatar, { login: comment.author }),
+          jsx('span', { style: S.ghActor, children: comment.author || 'ghost' }),
+          at ? jsx('span', { style: S.ghTiny, title: ghWhen(comment.created_at), children: at }) : null
         ]
       }),
-      reviews.length > 0
-        ? jsxs('div', {
-            style: S.ghSub,
-            children: [
-              jsx(Codicon, { name: 'comment-discussion', size: '0.75rem', style: { flex: 'none', color: 'var(--ui-text-quaternary)' } }),
-              ...reviews.slice(0, 4).map((review, i) =>
-                jsx(
-                  'span',
-                  {
-                    style: S.ghReviewRow,
-                    children: `${review.author || 'someone'}: ${String(review.state || '').toLowerCase()}`
-                  },
-                  `${review.author || 'x'}-${i}`
-                )
-              ),
-              reviews.length > 4
-                ? jsx('span', { style: { color: 'var(--ui-text-quaternary)' }, children: `+${reviews.length - 4} more` })
-                : null
-            ]
-          })
-        : null,
-      linked.length > 0
-        ? jsxs('div', {
-            style: S.ghSub,
-            children: [
-              jsx(Codicon, { name: 'issues', size: '0.75rem', style: { flex: 'none', color: 'var(--ui-text-quaternary)' } }),
-              jsx('span', { style: { color: 'var(--ui-text-quaternary)' }, children: 'closes' }),
-              jsx(GhIssueChips, { numbers: linked, onIssue })
-            ]
-          })
+      comment.body
+        ? jsx('div', { style: S.ghProse, children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(comment.body) }) })
+        : jsx('div', { style: S.ghQuiet, children: 'No comment text.' })
+    ]
+  })
+}
+
+function GhReviewEntry({ review, decorate }) {
+  const view = ghReviewView(review.state)
+  const at = ghAgo(review.submitted_at)
+
+  return jsxs('div', {
+    style: S.ghComment,
+    children: [
+      jsxs('div', {
+        style: S.ghCommentHead,
+        children: [
+          jsx(GhMiniAvatar, { login: review.author }),
+          jsx('span', { style: S.ghActor, children: review.author || 'ghost' }),
+          jsx(Badge, { size: 'xs', variant: view.variant, children: view.label }),
+          at ? jsx('span', { style: S.ghTiny, title: ghWhen(review.submitted_at), children: at }) : null
+        ]
+      }),
+      review.body
+        ? jsx('div', { style: S.ghProse, children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(review.body) }) })
         : null
     ]
   })
 }
 
-function GhPrRow({ folder, pr, sessions, expanded, onToggle, onIssue, flash }) {
+function GhDiffStat({ detail }) {
+  const parts = []
+  const files = Number(detail.changed_files) || 0
+
+  if (files) parts.push(`${files} ${files === 1 ? 'file' : 'files'}`)
+
+  return jsxs('span', {
+    style: S.ghDiff,
+    children: [
+      jsx('span', { style: { color: 'var(--ui-accent)' }, children: `+${Number(detail.additions) || 0}` }),
+      jsx('span', { style: { color: 'var(--dt-destructive)' }, children: `-${Number(detail.deletions) || 0}` }),
+      parts.length ? jsx('span', { children: parts.join(' · ') }) : null
+    ]
+  })
+}
+
+// The modal's meta line: who opened it, when it moved, labels, assignees, and —
+// for a PR — refs, the diff size, checks and the review decision.
+function GhModalMeta({ detail, kind, onOpen }) {
+  const labels = Array.isArray(detail.labels) ? detail.labels : []
+  const shown = labels.slice(0, GH_LABEL_CHIPS)
+  const assignees = Array.isArray(detail.assignees) ? detail.assignees : []
+  const created = ghWhen(detail.created_at)
+  const updated = ghWhen(detail.updated_at)
+  const checks = detail.checks
+  const linked = kind === 'pr' ? detail.linked_issues || [] : detail.linked_prs || []
+  const other = kind === 'pr' ? 'issue' : 'pr'
+
+  return jsxs('div', {
+    style: S.ghModalMeta,
+    children: [
+      jsx('span', { style: S.ghTiny, children: ghKindWord(kind) }),
+      detail.author
+        ? jsxs('span', {
+            style: S.ghActorRow,
+            children: [jsx(GhMiniAvatar, { login: detail.author }), jsx('span', { style: S.ghActor, children: detail.author })]
+          })
+        : null,
+      created ? jsx('span', { style: S.ghTiny, title: ghAgo(detail.created_at), children: `opened ${created}` }) : null,
+      updated ? jsx('span', { style: S.ghTiny, title: ghAgo(detail.updated_at), children: `updated ${updated}` }) : null,
+      ...shown.map((label, i) => jsx('span', { style: S.ghLabel, children: String(label) }, `${label}-${i}`)),
+      labels.length > shown.length ? jsx('span', { style: S.ghTiny, children: `+${labels.length - shown.length}` }) : null,
+      assignees.length > 0
+        ? jsxs('span', {
+            style: S.ghActorRow,
+            title: assignees.join(', '),
+            children: [
+              jsx(Codicon, { name: 'person', size: '0.6875rem', style: { flex: 'none' } }),
+              jsx('span', { style: S.ghActor, children: assignees.join(', ') })
+            ]
+          })
+        : null,
+      kind === 'pr'
+        ? jsxs('span', {
+            style: S.ghActorRow,
+            children: [
+              jsx(BranchChip, { branch: detail.head_ref || 'head' }),
+              jsx('span', { style: S.ghTiny, children: '→' }),
+              jsx('span', { style: S.ghTiny, children: detail.base_ref || 'base' }),
+              jsx(GhDiffStat, { detail })
+            ]
+          })
+        : null,
+      kind === 'pr' && (detail.files_changed || []).length > 0 ? jsx(GhFileChips, { files: detail.files_changed }) : null,
+      kind === 'pr' && checks ? jsx('span', { style: S.ghTiny, children: CHECKS_TEXT[checks.state] || 'checks reported' }) : null,
+      kind === 'pr' ? jsx(GhChecks, { checks }) : null,
+      kind === 'pr' ? jsx(GhReview, { decision: detail.review_decision }) : null,
+      linked.length > 0
+        ? jsx(GhIssueChips, { numbers: linked, onIssue: number => (onOpen ? onOpen(other, number) : null) })
+        : null
+    ]
+  })
+}
+
+// The loaded thread. Its own component so the refs query, the composer state and
+// the mutations only exist once there is a detail to talk about — no hook is
+// ever called conditionally.
+function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
+  const comments = Array.isArray(detail.comments) ? detail.comments : []
+  const reviews = kind === 'pr' && Array.isArray(detail.reviews) ? detail.reviews : []
+  const numbers = useMemo(
+    () => ghRefNumbers([detail.body, ...comments.map(c => c.body), ...reviews.map(r => r.body)]),
+    [detail]
+  )
+  const refQuery = useQuery({
+    enabled: Boolean(folder) && numbers.length > 0,
+    queryKey: [QUERY_ROOT, 'github', 'refs', folder, numbers.join(',')],
+    // A missing route, a 404 or a refusal all mean the same thing here: no
+    // chips, and the number stays the plain text the writer typed.
+    queryFn: () =>
+      ghRest(`/github/refs?path=${encodeURIComponent(folder)}&numbers=${numbers.join(',')}`).catch(() => null),
+    retry: false,
+    staleTime: 60000
+  })
+  const refsData = refQuery.data
+  const refs = useMemo(() => (refsData && refsData.ok && refsData.refs ? refsData.refs : {}), [refsData])
+  const decorate = useCallback(children => ghDecorateRefs(children, refs, onOpen, folder), [refs, onOpen, folder])
+
+  const [draft, setDraft] = useState('')
+  const [note, setNote] = useState('')
+  const [confirming, setConfirming] = useState(false)
+  const closed = String(detail.state || '').toLowerCase() !== 'open'
+  const detailKey = [QUERY_ROOT, 'github', kind, folder, number]
+  const path = `path=${encodeURIComponent(folder)}`
+
+  const post = useMutation({
+    mutationFn: text =>
+      ghRest(`/github/${kind}/${number}/comment?${path}`, { body: { body: text }, method: 'POST' }).catch(error => ({
+        error: ghReason(error),
+        ok: false
+      })),
+    onSuccess: res => {
+      if (res && res.ok) {
+        setDraft('')
+        setNote('')
+        queryClient.invalidateQueries({ queryKey: detailKey })
+        // The new comment may reference a number this view already asked about,
+        // and a refs payload cached before the write would keep that chip missing
+        // for its whole staleTime. Drop the refs reads with the thread.
+        queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'github', 'refs'] })
+
+        return
+      }
+      setNote(ghWriteFailure(res, 'The comment did not post.'))
+    }
+  })
+
+  const flip = useMutation({
+    mutationFn: state =>
+      ghRest(`/github/${kind}/${number}/state?${path}`, { body: { state }, method: 'POST' }).catch(error => ({
+        error: ghReason(error),
+        ok: false
+      })),
+    onSuccess: res => {
+      setConfirming(false)
+      if (res && res.ok) {
+        setNote('')
+        queryClient.invalidateQueries({ queryKey: detailKey })
+        queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'github', 'open', folder] })
+
+        return
+      }
+      setNote(ghWriteFailure(res, 'The state did not change.'))
+    }
+  })
+
+  const head = (icon, text, count) =>
+    jsxs('div', {
+      style: S.ghSectionHead,
+      children: [
+        jsx(Codicon, { name: icon, size: '0.75rem', style: { flex: 'none' } }),
+        jsx('span', { children: text }),
+        count != null ? jsx('span', { style: S.count, children: count }) : null
+      ]
+    })
+
+  return jsxs('div', {
+    style: S.ghThread,
+    children: [
+      jsxs('div', {
+        style: S.ghSection,
+        children: [
+          head('book', 'Description'),
+          detail.body
+            ? jsx('div', {
+                style: S.ghProse,
+                children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(detail.body) })
+              })
+            : jsx('div', { style: S.ghQuiet, children: 'No description.' })
+        ]
+      }),
+      reviews.length > 0
+        ? jsxs('div', {
+            style: S.ghSection,
+            children: [
+              head('comment-discussion', 'Reviews', reviews.length),
+              ...reviews.map((review, i) =>
+                jsx(GhReviewEntry, { decorate, review }, `${review.author || 'x'}-${review.submitted_at || i}`)
+              )
+            ]
+          })
+        : null,
+      jsxs('div', {
+        style: S.ghSection,
+        children: [
+          head('comment', 'Comments', comments.length),
+          comments.length > 0
+            ? comments.map((comment, i) =>
+                jsx(GhComment, { comment, decorate }, `${comment.id || comment.author || 'c'}-${comment.created_at || i}`)
+              )
+            : jsx('div', { style: S.ghQuiet, children: 'No comments yet.' })
+        ]
+      }),
+      jsxs('div', {
+        style: S.ghComposer,
+        children: [
+          note ? jsx('div', { role: 'alert', style: S.ghComposerError, children: note }) : null,
+          jsx(Textarea, {
+            'aria-label': `Comment on ${ghNumber(number)}`,
+            disabled: post.isPending,
+            onChange: event => setDraft(event.target.value),
+            placeholder: `Leave a comment on ${ghNumber(number)}…`,
+            rows: 3,
+            value: draft
+          }),
+          jsxs('div', {
+            style: S.ghComposerRow,
+            children: [
+              jsx(Button, {
+                disabled: !draft.trim() || post.isPending,
+                onClick: () => {
+                  if (draft.trim()) post.mutate(draft)
+                },
+                size: 'xs',
+                children: post.isPending ? 'Posting…' : 'Comment'
+              }),
+              confirming
+                ? jsxs('span', {
+                    style: S.ghComposerRow,
+                    children: [
+                      jsx(Button, {
+                        disabled: flip.isPending,
+                        onClick: () => flip.mutate('closed'),
+                        size: 'xs',
+                        variant: 'destructive',
+                        children: flip.isPending ? 'Closing…' : 'Confirm close'
+                      }),
+                      jsx(Button, {
+                        onClick: () => setConfirming(false),
+                        size: 'xs',
+                        variant: 'ghost',
+                        children: 'Cancel'
+                      })
+                    ]
+                  })
+                : jsx(Button, {
+                    disabled: flip.isPending || post.isPending,
+                    onClick: () => {
+                      if (closed) flip.mutate('open')
+                      else setConfirming(true)
+                    },
+                    size: 'xs',
+                    variant: 'outline',
+                    children: flip.isPending ? 'Working…' : closed ? 'Reopen' : 'Close'
+                  }),
+              jsx('span', { style: S.grow }),
+              jsx(StartSessionButton, {
+                folder,
+                issue: { ...detail, html_url: detail.url },
+                owner,
+                repo
+              })
+            ]
+          })
+        ]
+      })
+    ]
+  })
+}
+
+function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, repo }) {
+  const kind = entry.kind === 'pr' ? 'pr' : 'issue'
+  const number = Number(entry.number) || 0
+  const query = useQuery({
+    enabled: Boolean(folder) && number > 0,
+    queryKey: [QUERY_ROOT, 'github', kind, folder, number],
+    queryFn: () => ghRest(`/github/${kind}/${number}?path=${encodeURIComponent(folder)}`),
+    retry: false,
+    staleTime: 60000
+  })
+  const payload = query.data || null
+  const failed = payload && ((payload.code && payload.code !== 'ok') || payload.error) ? payload : null
+  const detail = payload && !failed ? payload : null
+  const title = (detail && detail.title) || `${ghKindWord(kind)} ${ghNumber(number)}`
+  const state = detail ? String(detail.state || 'open').toLowerCase() : ''
+  const url = detail && detail.url ? String(detail.url) : ''
+  const canOpenExternal = Boolean(pluginCtx && pluginCtx.os && typeof pluginCtx.os.openExternal === 'function')
+  const openExternal = () => {
+    if (!url || !canOpenExternal) return
+    Promise.resolve(pluginCtx.os.openExternal(url)).then(ok => {
+      if (ok === false) host.notify({ kind: 'warning', message: 'Could not open the browser.' })
+    })
+  }
+
+  return jsxs(Dialog, {
+    onOpenChange: next => {
+      if (!next) onClose()
+    },
+    open: true,
+    children: [
+      jsxs(DialogContent, {
+        className: 'max-w-3xl',
+        children: [
+          jsxs(DialogHeader, {
+            style: S.ghModalHead,
+            children: [
+              jsxs('div', {
+                style: S.ghModalTitleRow,
+                children: [
+                  depth > 1 && onBack
+                    ? jsx('button', {
+                        'aria-label': 'Back',
+                        className: 'pcc-gh-back',
+                        onClick: onBack,
+                        style: S.ghBackBtn,
+                        title: 'Back',
+                        type: 'button',
+                        children: jsx(Codicon, { name: 'chevron-left', size: '0.875rem' })
+                      })
+                    : jsx(Codicon, {
+                        name: ghKindGlyph(kind),
+                        size: '0.875rem',
+                        style: { flex: 'none', color: 'var(--ui-text-secondary)', paddingTop: 2 }
+                      }),
+                  jsx('span', { style: S.ghModalNum, children: ghNumber(number) }),
+                  jsx(DialogTitle, { style: S.ghModalTitle, children: title }),
+                  detail ? jsx(Badge, { size: 'xs', variant: state === 'open' ? 'success' : 'muted', children: state || 'unknown' }) : null,
+                  url && canOpenExternal
+                    ? jsxs('button', {
+                        className: 'pcc-gh-chip',
+                        onClick: openExternal,
+                        style: S.ghChipBtn,
+                        title: 'View on GitHub',
+                        type: 'button',
+                        children: ['View on GitHub', jsx(Codicon, { name: 'link-external', size: '0.6875rem' })]
+                      })
+                    : null
+                ]
+              }),
+              detail ? jsx(GhModalMeta, { detail, kind, onOpen }) : null
+            ]
+          }),
+          query.isLoading && !detail
+            ? jsxs('div', {
+                style: S.ghSection,
+                children: [
+                  jsx(Skeleton, { style: { height: 12, width: '82%' } }),
+                  jsx(Skeleton, { style: { height: 12, width: '64%' } }),
+                  jsx(Skeleton, { style: { height: 12, width: '48%' } })
+                ]
+              })
+            : null,
+          query.isError && !detail ? jsx('div', { style: S.ghQuiet, children: `Could not load this ${ghKindWord(kind)}.` }) : null,
+          failed ? jsx(GhFailure, { data: failed, folder }) : null,
+          detail ? jsx(GhDetailThread, { detail, folder, kind, number, onOpen, owner, repo }) : null
+        ]
+      })
+    ]
+  })
+}
+
+function GhPrRow({ pr, sessions, onIssue, onOpen, flash }) {
   const linked = pr.linked_issues || []
   const look = ghPrLook(pr)
 
@@ -2179,10 +3002,10 @@ function GhPrRow({ folder, pr, sessions, expanded, onToggle, onIssue, flash }) {
         style: S.ghLine,
         children: [
           jsxs('button', {
-            'aria-expanded': expanded,
             className: 'pcc-gh-title',
-            onClick: onToggle,
+            onClick: onOpen,
             style: S.ghTitleBtn,
+            title: 'Open the pull request thread',
             type: 'button',
             children: [
               jsx(Codicon, {
@@ -2193,7 +3016,7 @@ function GhPrRow({ folder, pr, sessions, expanded, onToggle, onIssue, flash }) {
               jsx('span', { style: S.ghNum, children: ghNumber(pr.number) }),
               jsx('span', { style: S.ghTitle, children: pr.title || 'Untitled pull request' }),
               jsx(Codicon, {
-                name: expanded ? 'chevron-down' : 'chevron-right',
+                name: 'chevron-right',
                 size: '0.75rem',
                 style: { flex: 'none', color: 'var(--ui-text-quaternary)', paddingTop: 2 }
               })
@@ -2219,8 +3042,7 @@ function GhPrRow({ folder, pr, sessions, expanded, onToggle, onIssue, flash }) {
               })
             : null
         ]
-      }),
-      expanded ? jsx(GhPrDetail, { folder, number: pr.number, onIssue }) : null
+      })
     ]
   })
 }
@@ -2439,84 +3261,7 @@ function StartSessionButton({ folder, issue, owner, repo }) {
   })
 }
 
-function GhIssueDetail({ folder, number, onOpenPr, owner, repo }) {
-  const query = useQuery({
-    enabled: Boolean(folder),
-    queryKey: [QUERY_ROOT, 'github', 'issue', folder, number],
-    queryFn: () => ghRest(`/github/issue/${number}?path=${encodeURIComponent(folder)}`),
-    retry: false,
-    staleTime: 60000
-  })
-
-  if (query.isLoading) {
-    return jsxs('div', {
-      style: S.ghDetail,
-      children: [
-        jsx(Skeleton, { style: { height: 10, width: '76%' } }),
-        jsx(Skeleton, { style: { height: 10, width: '48%' } })
-      ]
-    })
-  }
-
-  const issue = query.data
-
-  if (query.isError) return jsx('div', { style: S.ghQuiet, children: 'Could not load this issue.' })
-  if (issue && ((issue.code && issue.code !== 'ok') || issue.error)) return jsx(GhFailure, { data: issue, folder })
-  if (!issue) return jsx('div', { style: S.ghQuiet, children: 'No detail for this issue.' })
-
-  const body = String(issue.body || '').slice(0, PR_BODY_CHARS)
-  const pulls = issue.linked_prs || []
-  const timeline = issue.timeline_prs || []
-
-  return jsxs('div', {
-    style: S.ghDetail,
-    children: [
-      body ? jsx('div', { style: S.ghBody, children: body }) : jsx('div', { style: S.ghQuiet, children: 'No description.' }),
-      pulls.length > 0
-        ? jsxs('div', {
-            style: S.ghSub,
-            children: [
-              jsx(Codicon, { name: 'git-pull-request', size: '0.75rem', style: { flex: 'none', color: 'var(--ui-text-quaternary)' } }),
-              jsxs('span', {
-                children: [
-                  `${pulls.length} linked ${pulls.length === 1 ? 'pull request' : 'pull requests'}`,
-                  timeline.length > 0 ? ` (${timeline.length} in the timeline)` : ''
-                ]
-              })
-            ]
-          })
-        : null,
-      pulls.length > 0
-        ? jsx('div', {
-            style: { display: 'flex', flexDirection: 'column' },
-            children: pulls.map(n =>
-              jsxs(
-                'button',
-                {
-                  className: 'pcc-gh-sub-btn',
-                  onClick: () => onOpenPr(n),
-                  style: S.ghSubBtn,
-                  type: 'button',
-                  children: [
-                    jsx(Codicon, { name: 'git-pull-request', size: '0.75rem', style: { flex: 'none', color: 'var(--ui-text-secondary)' } }),
-                    jsx('span', { style: { color: 'var(--ui-text-secondary)' }, children: ghNumber(n) }),
-                    jsx('span', { style: { color: 'var(--ui-text-quaternary)' }, children: 'open in In flight' })
-                  ]
-                },
-                n
-              )
-            )
-          })
-        : null,
-      jsx('div', {
-        style: S.ghActions,
-        children: jsx(StartSessionButton, { folder, issue, owner, repo })
-      })
-    ]
-  })
-}
-
-function GhIssueRow({ folder, issue, prs, sessionsByBranch, expanded, onToggle, onOpenPr, flash, owner, repo }) {
+function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, flash, owner, repo }) {
   const labels = issue.labels || []
   const shownLabels = labels.slice(0, 3)
   const restLabels = labels.length - shownLabels.length
@@ -2531,10 +3276,10 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, expanded, onToggle, 
         style: S.ghLine,
         children: [
           jsxs('button', {
-            'aria-expanded': expanded,
             className: 'pcc-gh-title',
-            onClick: onToggle,
+            onClick: onOpen,
             style: S.ghTitleBtn,
+            title: 'Open the issue thread',
             type: 'button',
             children: [
               jsx(Codicon, {
@@ -2545,7 +3290,7 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, expanded, onToggle, 
               jsx('span', { style: S.ghNum, children: ghNumber(issue.number) }),
               jsx('span', { style: S.ghTitle, children: issue.title || 'Untitled issue' }),
               jsx(Codicon, {
-                name: expanded ? 'chevron-down' : 'chevron-right',
+                name: 'chevron-right',
                 size: '0.75rem',
                 style: { flex: 'none', color: 'var(--ui-text-quaternary)', paddingTop: 2 }
               })
@@ -2572,14 +3317,15 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, expanded, onToggle, 
               })
             : null,
           jsx('span', { style: S.grow }),
-          // Expanded, the same action lives in the detail footer instead.
-          expanded ? null : jsx(StartSessionButton, { folder, issue, owner, repo }),
+          // The same action sits in the modal footer, so it is always the same
+          // one click from either place.
+          jsx(StartSessionButton, { folder, issue, owner, repo }),
           prs.length > 0
             ? jsx('span', { style: { color: 'var(--ui-text-tertiary)' }, children: `${prs.length} ${prs.length === 1 ? 'PR' : 'PRs'}` })
             : jsx('span', { children: 'no PR' })
         ]
       }),
-      prs.length > 0 && !expanded
+      prs.length > 0
         ? jsx('div', {
             style: { display: 'flex', flexDirection: 'column' },
             children: prs
@@ -2592,8 +3338,7 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, expanded, onToggle, 
                 )
               )
           })
-        : null,
-      expanded ? jsx(GhIssueDetail, { folder, number: issue.number, onOpenPr, owner, repo }) : null
+        : null
     ]
   })
 }
@@ -2650,7 +3395,7 @@ function GhBranchRow({ row, onOpenPr, onIssue }) {
   })
 }
 
-function GhShippedRow({ folder, pr, expanded, onToggle }) {
+function GhShippedRow({ pr, onOpen }) {
   const linked = pr.linked_issues || []
 
   return jsxs('div', {
@@ -2662,10 +3407,10 @@ function GhShippedRow({ folder, pr, expanded, onToggle }) {
         style: S.ghLine,
         children: [
           jsxs('button', {
-            'aria-expanded': expanded,
             className: 'pcc-gh-title',
-            onClick: onToggle,
+            onClick: onOpen,
             style: S.ghTitleBtn,
+            title: 'Open the pull request thread',
             type: 'button',
             children: [
               jsx(Codicon, {
@@ -2680,15 +3425,17 @@ function GhShippedRow({ folder, pr, expanded, onToggle }) {
           linked.length > 0 ? jsx(GhIssueChips, { numbers: linked }) : null,
           jsx('span', { style: S.ghAge, children: ghAgo(pr.updated_at) })
         ]
-      }),
-      expanded ? jsx(GhPrDetail, { folder, number: pr.number }) : null
+      })
     ]
   })
 }
 
 function GithubSection({ folder, projectId, sessionsByBranch }) {
   const preset = useValue($ghPreset)
-  const [expanded, setExpanded] = useState(null)
+  // The detail modal's navigation stack: one {kind, number} per open thread, last
+  // on screen. A #123 chip pushes, Back pops, closing empties it, and the whole
+  // thing lives here so a row, a chip and a review all reach the same door.
+  const [stack, setStack] = useState([])
   const [focus, setFocus] = useState(null)
   const [flash, setFlash] = useState(null)
   const [spin, setSpin] = useState(false)
@@ -2808,11 +3555,22 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
     return undefined
   }, [pokeAt])
 
-  const togglePr = number =>
-    setExpanded(prev => (prev && prev.kind === 'pr' && prev.number === number ? null : { kind: 'pr', number }))
-  const toggleIssue = number =>
-    setExpanded(prev => (prev && prev.kind === 'issue' && prev.number === number ? null : { kind: 'issue', number }))
+  const openEntry = useCallback((kind, number) => {
+    const entry = { kind: kind === 'pr' ? 'pr' : 'issue', number: Number(number) || 0 }
 
+    if (!entry.number) return
+    setStack(prev => {
+      const last = prev[prev.length - 1]
+
+      return last && last.kind === entry.kind && last.number === entry.number ? prev : [...prev, entry]
+    })
+  }, [])
+  const backEntry = useCallback(() => setStack(prev => prev.slice(0, -1)), [])
+  const closeEntry = useCallback(() => setStack([]), [])
+  const currentEntry = stack.length > 0 ? stack[stack.length - 1] : null
+
+  // Jumps from a row's linked chips stay list jumps (they also retarget the
+  // preset); only the modal's own chips push onto its stack.
   const goIssue = number => {
     writeGhPreset('issue')
     setFocus({ kind: 'issue', number, at: Date.now() })
@@ -2820,12 +3578,10 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
 
   const goPr = number => {
     writeGhPreset('flight')
-    setExpanded({ kind: 'pr', number })
     setFocus({ kind: 'pr', number, at: Date.now() })
   }
 
   const flashFor = (kind, number) => Boolean(flash && flash.kind === kind && flash.number === number)
-  const isExpanded = (kind, number) => Boolean(expanded && expanded.kind === kind && expanded.number === number)
 
   const ownerRepo = data && data.owner && data.repo ? `${data.owner}/${data.repo}` : repo && repo.owner && repo.repo ? `${repo.owner}/${repo.repo}` : ''
   // The issue rows need the two halves separately to build a URL and a link row.
@@ -2865,11 +3621,9 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
               jsx(
                 GhPrRow,
                 {
-                  expanded: isExpanded('pr', pr.number),
                   flash: flashFor('pr', pr.number),
-                  folder,
                   onIssue: goIssue,
-                  onToggle: () => togglePr(pr.number),
+                  onOpen: () => openEntry('pr', pr.number),
                   pr,
                   sessions: sessionsByBranch.get(pr.head_ref)
                 },
@@ -2910,12 +3664,11 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
               jsx(
                 GhIssueRow,
                 {
-                  expanded: isExpanded('issue', issue.number),
                   flash: flashFor('issue', issue.number),
                   folder,
                   issue,
+                  onOpen: () => openEntry('issue', issue.number),
                   onOpenPr: goPr,
-                  onToggle: () => toggleIssue(issue.number),
                   owner: ownerName,
                   prs: linkedPrs.get(issue.number) || [],
                   repo: repoName,
@@ -2990,11 +3743,9 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
               jsx(
                 GhPrRow,
                 {
-                  expanded: isExpanded('pr', pr.number),
                   flash: flashFor('pr', pr.number),
-                  folder,
                   onIssue: goIssue,
-                  onToggle: () => togglePr(pr.number),
+                  onOpen: () => openEntry('pr', pr.number),
                   pr,
                   sessions: sessionsByBranch.get(pr.head_ref)
                 },
@@ -3031,9 +3782,7 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
               jsx(
                 GhShippedRow,
                 {
-                  expanded: isExpanded('pr', pr.number),
-                  folder,
-                  onToggle: () => togglePr(pr.number),
+                  onOpen: () => openEntry('pr', pr.number),
                   pr
                 },
                 pr.number
@@ -3237,7 +3986,23 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
         ]
       }),
       diagnoseView(),
-      body
+      body,
+      currentEntry
+        ? jsx(
+            GhDetailModal,
+            {
+              depth: stack.length,
+              entry: currentEntry,
+              folder,
+              onBack: backEntry,
+              onClose: closeEntry,
+              onOpen: openEntry,
+              owner: ownerName,
+              repo: repoName
+            },
+            `${currentEntry.kind}-${currentEntry.number}`
+          )
+        : null
     ]
   })
 }
@@ -3628,6 +4393,8 @@ function ProjectsPage() {
   // route is not mounted yet. Project sync rides the same read.
   const boardState = useBoard()
   const linksForProject = useMemo(() => linksByProject(boardState.links), [boardState.links])
+  // One /github/counts read for every column; a column takes its own folder's entry.
+  const repoCounts = useRepoCounts(projects)
 
   useProjectSync(projects)
   const projectBySession = useMemo(() => {
@@ -3687,6 +4454,7 @@ function ProjectsPage() {
           ProjectColumn,
           {
             index: i,
+            counts: Object.prototype.hasOwnProperty.call(repoCounts, primaryPath(p)) ? repoCounts[primaryPath(p)] : null,
             links: linksForProject.get(p.id),
             liveByStored: live.byStored,
             onOpenProject: openProject,

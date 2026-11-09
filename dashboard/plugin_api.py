@@ -8,21 +8,35 @@ with ``ctx.rest('/repo?path=...')``.
     one folder, cached 20 s per resolved root (a board asks for many projects).
   * GitHub: issues and pull requests for that folder's ``origin``, with PR to
     issue links taken from GraphQL ``closingIssuesReferences`` (GitHub's own
-    answer) merged with the ``closes #12`` body fallback.
+    answer) merged with the ``closes #12`` body fallback. One issue or PR
+    resolves to a full detail payload (body, first 100 comments oldest first,
+    submitted reviews, checks, changed files), and ``GET /github/refs`` resolves
+    a list of ``#numbers`` in one batched GraphQL call for the chip row.
   * board: the server side state of the board itself, in
     ``<hermes home>/plugin-data/project-command-center/board.db`` through
     ``board_store.py`` (statuses, session links, the project ids the board knows).
     ``GET /board`` reads it; ``POST /board/status``, ``/board/link``,
     ``/board/projects`` and ``/board/seed`` write it, each inside one short SQLite
     transaction, and each broadcast ``board.changed`` so the Desktop refreshes.
+  * icons: ``GET /icon`` answers "what is the best icon for this folder" from a
+    fixed candidate path list (no tree walk) with the bytes sniffed, then a remote
+    favicon or the GitHub owner avatar behind an SSRF guard and a kill file, then
+    a stack key (``laravel``, ``nuxt``, ``python``, ...) for the Desktop's glyph.
+    It always answers 200: an image, a glyph, or a code for a folder that is gone.
 
-No git or GitHub writes: no git command mutates a repository and no GitHub write
-endpoint is called; the only writes in this file are the board rows named above.
+No git writes: no git command mutates a repository. GitHub writes are four
+routes and nothing else: ``POST /github/issue/{n}/comment`` and
+``POST /github/pr/{n}/comment`` post one comment, and
+``POST /github/issue/{n}/state`` / ``POST /github/pr/{n}/state`` set open or
+closed. All four write over the authenticated ``gh`` CLI as that account (never
+the token), with a JSON body on the child's stdin so no comment text is ever
+quoted into a command line.
 No shell: every child is ``create_subprocess_exec`` with an argv and a
-timeout. No credential files: ``GITHUB_TOKEN`` comes from
-``agent.secret_scope.get_secret`` inside the handler (catalog rule 11); with no
-token the user's own authenticated ``gh`` CLI is used, and with neither, public
-reads go unauthenticated while a private read reports ``auth: "none"``. A token
+timeout; no ``shell=True``, no ``os.system``, no command string. No credential
+files: ``GITHUB_TOKEN`` comes from ``agent.secret_scope.get_secret`` inside the
+handler (catalog rule 11); with no token the user's own authenticated ``gh`` CLI
+is used, and with neither, public reads go unauthenticated while a private read
+reports ``auth: "none"``. A token
 that GitHub rejects is retried once through ``gh``, and ``auth``/``auth_note``
 report which credential answered and why it changed; the token value itself is
 never logged, returned or compared against a file.
@@ -39,24 +53,28 @@ from inside the gateway.
 
 Caching is one in process dict keyed by (owner, repo, endpoint, params) with a
 60 s TTL; with a token the board read revalidates with the stored ETag, and
-``refresh=1`` bypasses it.
+``refresh=1`` bypasses it. Icon results use their own keys: a local image 300 s
+(folder, file path, mtime), a remote image 3600 s, a glyph 300 s.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
+import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple, Optional, Sequence, TypedDict
-from urllib.parse import urlencode
+from typing import Any, Mapping, NamedTuple, Optional, Sequence, TypedDict, Union
+from urllib.parse import urlencode, urljoin, urlsplit
 
 import httpx
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -80,15 +98,24 @@ MAX_CONCURRENT_GITHUB_CALLS = 2
 # past it carry REST fields and enriched: false.
 MAX_PRS_ENRICHED = 10
 MAX_BRANCHES = 40
+MAX_COMMENTS = 100
+MAX_REFS = 50
+MAX_COUNT_PATHS = 50
 API = "https://api.github.com"
 
 ISOLATION_NOTE = (
     "git runs as a local subprocess inside the gateway process (no shell, 5 s timeout), "
     "only inside the absolute folder passed as path. GitHub reads go to api.github.com using the "
-    "profile's GITHUB_TOKEN, or through your authenticated gh CLI when no token is set. Nothing here "
-    "writes to a repository or to GitHub, returns file contents, or opens a credential file. The one "
-    "write surface is the board store: statuses, session links and project ids in a local SQLite file "
-    "under <hermes home>/plugin-data/project-command-center/board.db."
+    "profile's GITHUB_TOKEN, or through your authenticated gh CLI when no token is set. GitHub "
+    "writes (a comment on an issue or pull request, and opening or closing one) run only through "
+    "your authenticated gh CLI, as that account, with the request body on the child's stdin. The "
+    "/icon route reads icon files inside that folder and, unless "
+    "<hermes home>/plugin-data/project-command-center/icons_remote.off exists, may fetch one "
+    "favicon from the homepage host the project declares or the GitHub owner avatar, https only "
+    "and never a private address. No "
+    "file contents are returned and no credential file is opened. The other write surface is the "
+    "board store: statuses, session links and project ids in a local SQLite file under "
+    "<hermes home>/plugin-data/project-command-center/board.db."
 )
 
 
@@ -151,6 +178,36 @@ class PullRow(TypedDict):
     enriched: bool
 
 
+class CommentRow(TypedDict):
+    """One issue or PR comment, as the modal renders it."""
+
+    id: int
+    author: Optional[str]
+    body: str
+    created_at: Optional[str]
+    updated_at: Optional[str]
+    url: Optional[str]
+
+
+class ReviewRow(TypedDict):
+    author: Optional[str]
+    state: Optional[str]
+    body: str
+    submitted_at: Optional[str]
+
+
+class RefRow(TypedDict):
+    """One resolved ``#number`` chip: which kind of thing it is and its state."""
+
+    number: int
+    kind: str  # "issue" | "pr"
+    title: str
+    state: str
+    author: Optional[str]
+    updated_at: Optional[str]
+    url: Optional[str]
+
+
 class Counts(TypedDict):
     issues_open: int
     prs_open: int
@@ -211,6 +268,12 @@ class _GitError(RuntimeError):
 FAILURE_CODES = frozenset({"folder_missing", "not_a_repo", "no_remote", "repo_not_found",
                            "no_auth", "rate_limited", "network", "upstream_error"})
 
+# The codes a write route answers with. A write names its own failure in one
+# sentence and never raises: shell level exit codes and HTTP statuses both become
+# one of these, and an unknown code is upstream_error rather than a class name.
+WRITE_CODES = frozenset({"empty_comment", "bad_state", "not_found", "forbidden",
+                         "rate_limited", "upstream_error"})
+
 
 class _FolderMissing(Exception):
     """An absolute, well formed path that names no existing directory."""
@@ -269,14 +332,23 @@ class _Response(NamedTuple):
     headers: dict[str, str]
 
 
-async def _run(argv: Sequence[str], *, timeout: float) -> tuple[int, str, str]:
-    """Run argv with no shell. Raises TimeoutError after *timeout* seconds."""
+async def _run(argv: Sequence[str], *, timeout: float,
+               stdin_data: Optional[str] = None) -> tuple[int, str, str]:
+    """Run argv with no shell. Raises TimeoutError after *timeout* seconds.
+
+    ``stdin_data`` is the only way a request body reaches a child: it is written
+    to the pipe, never spliced into an argument, so quotes and newlines in a
+    comment cannot change what the child runs.
+    """
     proc = await asyncio.create_subprocess_exec(
-        *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        *argv,
+        stdin=asyncio.subprocess.PIPE if stdin_data is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, env=_child_env(),
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout)
+        out, err = await asyncio.wait_for(
+            proc.communicate(stdin_data.encode("utf-8") if stdin_data is not None else None), timeout)
     except (asyncio.TimeoutError, TimeoutError) as exc:
         proc.kill()
         await proc.wait()
@@ -637,8 +709,15 @@ class _GitHub:
                 endpoint=endpoint, status=response.status_code,
                 credential=self.mode) from exc
 
-    async def graphql(self, query: str, variables: Mapping[str, Any]) -> Optional[dict[str, Any]]:
-        """The GraphQL answer, or None when there is no authenticated route or it errored."""
+    async def graphql(self, query: str, variables: Mapping[str, Any],
+                      partial: bool = False) -> Optional[dict[str, Any]]:
+        """The GraphQL answer, or None when there is no authenticated route or it errored.
+
+        ``partial`` accepts an answer that carries ``errors`` as long as it also
+        carries ``data``. A batched alias per number needs it: GitHub answers
+        NOT_FOUND for each number that does not exist, which is exactly the case
+        the caller handles by leaving that number out.
+        """
         if self.mode == "none":
             return None
         async with self._slots:
@@ -652,7 +731,7 @@ class _GitHub:
                     raise _UpstreamError(f"gh is installed but not usable: {exc}", code="network",
                                          detail="POST /graphql -> no answer", endpoint="/graphql",
                                          credential="gh") from exc
-                if code != 0:
+                if code != 0 and not partial:
                     raise _UpstreamError(f"gh api graphql failed: {(err or out).strip()[:300]}",
                                          code="upstream_error", detail="POST /graphql failed",
                                          endpoint="/graphql", credential="gh")
@@ -679,10 +758,14 @@ class _GitHub:
             return None
         if body.get("errors"):
             first = body["errors"][0] if isinstance(body["errors"], list) else {}
-            log.info("project-command-center: GraphQL error: %s",
-                     (first.get("message") if isinstance(first, dict) else None)
-                     or json.dumps(first)[:200])
-            return None
+            if not partial:
+                log.info("project-command-center: GraphQL error: %s",
+                         (first.get("message") if isinstance(first, dict) else None)
+                         or json.dumps(first)[:200])
+                return None
+            # partial: NOT_FOUND per missing alias is expected, data still stands
+            log.debug("project-command-center: GraphQL partial answer with %s error(s)",
+                      len(body["errors"]))
         return body.get("data") if isinstance(body.get("data"), dict) else None
 
 
@@ -744,6 +827,25 @@ def _github_sentence(exc: _UpstreamError, owner: str, repo: str,
     return f"GitHub could not answer for {slug} as {who} ({status or 'no status'})."
 
 
+_REPO_ALIAS_RE = re.compile(r"^r\d+$")
+
+
+def _graphql_blind(data: Optional[dict[str, Any]]) -> bool:
+    """True when a batched ``repository`` query came back with every alias null.
+
+    A token that cannot see a private repository gets ``repository: null`` with a
+    NOT_FOUND beside it, so ``partial`` would read a blind credential as "no such
+    repository". Every alias null is the signal that the credential, not the repo,
+    is the problem. A mixed answer is a real "some of these do not exist" and is
+    left alone.
+    """
+    if not isinstance(data, dict):
+        return False
+    aliases = [value for key, value in data.items()
+               if isinstance(key, str) and _REPO_ALIAS_RE.match(key)]
+    return bool(aliases) and all(value is None for value in aliases)
+
+
 class _GhReader:
     """One repository read through the preferred credential, with a gh retry.
 
@@ -801,19 +903,35 @@ class _GhReader:
         self.answered = self.credential
         return response
 
-    async def graphql(self, query: str, variables: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    async def graphql(self, query: str, variables: Mapping[str, Any],
+                      partial: bool = False) -> Optional[dict[str, Any]]:
         if self._fell_back:
-            data = await self._client.graphql(query, variables)
+            data = await self._client.graphql(query, variables, partial)
             self.answered = self.credential
             return data
         try:
-            data = await self._primary.graphql(query, variables)
+            data = await self._primary.graphql(query, variables, partial)
         except _UpstreamError as exc:
             if not self._can_retry(exc):
                 raise
             await self._fall_back(exc)
-            data = await self._client.graphql(query, variables)
+            data = await self._client.graphql(query, variables, partial)
             await self._confirm(exc)
+        else:
+            # A token that cannot see a private repository answers ``repository: null``
+            # with a NOT_FOUND beside it, which ``partial`` would accept as "no such
+            # repository". Every alias being null is a credential blind spot, not an
+            # empty answer, so it earns the same one retry through gh.
+            if partial and _graphql_blind(data) and self._can_retry(
+                    _UpstreamError(f"the credential cannot see {self.owner}/{self.repo}",
+                                   code="repo_not_found", status=404, endpoint="/graphql",
+                                   credential=self.credential, rejected=True)):
+                exc = _UpstreamError(f"the credential cannot see {self.owner}/{self.repo}",
+                                     code="repo_not_found", status=404, endpoint="/graphql",
+                                     credential=self.credential, rejected=True)
+                await self._fall_back(exc)
+                data = await self._client.graphql(query, variables, partial)
+                await self._confirm(exc)
         self.answered = self.credential
         return data
 
@@ -872,6 +990,53 @@ def _pr_query(owner: str, repo: str, numbers: Sequence[int]) -> tuple[str, dict[
         fields.append(f"p{index}: pullRequest(number: $n{index}) {{{_PR_FIELDS}}}")
     query = (f"query({', '.join(definitions)}) {{ repository(owner: $owner, name: $repo) "
              f"{{ {' '.join(fields)} }} }}")
+    return query, variables
+
+
+_REF_FIELDS = """
+  __typename
+  ... on Issue { number title state url updatedAt author { login } }
+  ... on PullRequest { number title state url updatedAt author { login } }
+"""
+
+
+def _refs_query(owner: str, repo: str, numbers: Sequence[int]) -> tuple[str, dict[str, Any]]:
+    """One aliased ``issueOrPullRequest`` per number: the whole set in one call.
+
+    A number that does not exist resolves to null and is simply left out of the
+    answer; a PR state of MERGED is reported as ``closed``, because that is what
+    the chip shows. MAX_REFS bounds the aliases at GitHub's own field limit.
+    """
+    definitions = ["$owner: String!", "$repo: String!"]
+    variables: dict[str, Any] = {"owner": owner, "repo": repo}
+    fields = []
+    for index, number in enumerate(numbers):
+        definitions.append(f"$n{index}: Int!")
+        variables[f"n{index}"] = number
+        fields.append(f"r{index}: issueOrPullRequest(number: $n{index}) {{{_REF_FIELDS}}}")
+    query = (f"query({', '.join(definitions)}) {{ repository(owner: $owner, name: $repo) "
+             f"{{ {' '.join(fields)} }} }}")
+    return query, variables
+
+
+def _counts_query(repos: Sequence[tuple[str, str]]) -> tuple[str, dict[str, Any]]:
+    """One aliased ``repository`` per (owner, repo): open issue and PR totals, one call.
+
+    GitHub's GraphQL ``issues`` connection holds issues only (a pull request is
+    not an issue there), so ``issues`` and ``pullRequests`` cannot double count;
+    REST's ``/issues`` endpoint, which does return PRs, is not used here.
+    """
+    definitions: list[str] = []
+    variables: dict[str, Any] = {}
+    fields = []
+    for index, (owner, repo) in enumerate(repos):
+        definitions += [f"$o{index}: String!", f"$n{index}: String!"]
+        variables[f"o{index}"] = owner
+        variables[f"n{index}"] = repo
+        fields.append(f"r{index}: repository(owner: $o{index}, name: $n{index}) "
+                      "{ issues(states: OPEN) { totalCount } "
+                      "pullRequests(states: OPEN) { totalCount } }")
+    query = f"query({', '.join(definitions)}) {{ {' '.join(fields)} }}"
     return query, variables
 
 
@@ -975,6 +1140,43 @@ def _pull_row(raw: Mapping[str, Any], node: Optional[Mapping[str, Any]]) -> Pull
             raw.get("mergeable_state") or merge_state.lower() or "unknown"),
         "enriched": bool(node),
     }
+
+
+def _comment_rows(rows: Any) -> list[CommentRow]:
+    """The modal's comment shape: id, author login, markdown verbatim, times, url.
+
+    Oldest first, first MAX_COMMENTS: the REST list is asked for
+    ``sort=created&direction=asc`` and sliced here so the cap holds even if a
+    server ignores the direction.
+    """
+    out: list[CommentRow] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        out.append({
+            "id": _int(row.get("id")),
+            "author": _login(row.get("user")),
+            "body": str(row.get("body") or ""),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+            "url": row.get("html_url"),
+        })
+    return out[:MAX_COMMENTS]
+
+
+def _review_rows(rows: Any) -> list[ReviewRow]:
+    """Submitted reviews only: an unsubmitted PENDING review has no submitted_at."""
+    out: list[ReviewRow] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or not row.get("submitted_at"):
+            continue
+        out.append({
+            "author": _login(row.get("user")),
+            "state": row.get("state"),
+            "body": str(row.get("body") or ""),
+            "submitted_at": row.get("submitted_at"),
+        })
+    return out
 
 
 def _counts(issues: Sequence[IssueRow], pulls: Sequence[PullRow]) -> Counts:
@@ -1100,6 +1302,604 @@ def _cached_inverse(owner: str, repo: str, issue: int) -> list[int]:
                 found.add(_int(pull.get("number")))
     found.discard(0)
     return sorted(found)
+
+
+# --- GitHub writes ------------------------------------------------------------
+#
+# Four routes and nothing else writes to GitHub: a comment on an issue, a comment
+# on a pull request, and open/closed on either. All of them run as the gh CLI's
+# own account (never the configured token, which is a read credential) and all of
+# them hand the JSON body to the child on stdin. GitHub keeps issues and pull
+# requests in one number sequence and its comment and state endpoints accept
+# either, so each route confirms the number is the kind it says before writing.
+
+
+class _WriteFailure(Exception):
+    """A write failed in a way the Desktop renders as one code and one sentence."""
+
+    def __init__(self, code: str, error: str, detail: Optional[str] = None) -> None:
+        super().__init__(error)
+        self.code = code if code in WRITE_CODES else "upstream_error"
+        self.error = error
+        self.detail = detail
+
+
+def _write_failure(exc: _WriteFailure) -> dict[str, Any]:
+    return {"ok": False, "code": exc.code, "error": exc.error, "detail": exc.detail}
+
+
+def _cache_drop(owner: str, name: str) -> None:
+    """Forget this repo's cached reads so the modal's next read sees the write."""
+    doomed = [key for key in _CACHE
+              if len(key) > 2 and key[0] in ("github", "issue", "pr", "refs")
+              and key[1] == owner.lower() and key[2] == name.lower()]
+    for key in doomed:
+        _CACHE.pop(key, None)
+
+
+async def _gh_write(method: str, path: str, body: Mapping[str, Any], *, subject: str,
+                    action: str, owner: str, repo: str, number: int) -> Any:
+    """One ``gh api`` write with the JSON body on the child's stdin.
+
+    The argv is fixed — ``gh api -i --method <M> --input - <endpoint>`` — so the
+    body never appears in an argument and there is no shell: a comment holding
+    quotes, backticks, ``$(`` or newlines arrives byte for byte. Statuses become
+    codes: 404 ``not_found``, 401/403 ``forbidden`` (a spent 403 or 429 is
+    ``rate_limited``), anything else ``upstream_error``.
+    """
+    argv = ["gh", "api", "-i", "--method", method.upper(), "--input", "-", path]
+    try:
+        code, out, err = await _run(argv, timeout=GH_TIMEOUT,
+                                    stdin_data=json.dumps(dict(body), ensure_ascii=False))
+    except TimeoutError as exc:
+        raise _WriteFailure(
+            "upstream_error",
+            f"GitHub did not answer within {GH_TIMEOUT:.0f} s; nothing was written to "
+            f"{subject} #{number}.") from exc
+    except OSError as exc:
+        raise _WriteFailure("upstream_error",
+                            f"gh could not be started ({type(exc).__name__}); nothing was written.") from exc
+    status, headers, text = _parse_gh_response(out)
+    if status == 0:
+        message = (err or out).strip()[:300]
+        authish = re.search(r"auth|logged in|permission|forbidden", message, re.I)
+        raise _WriteFailure(
+            "forbidden" if authish else "upstream_error",
+            (f"gh could not {action} {subject} #{number} on {owner}/{repo}: {message}"
+             if message else f"gh exited {code} without an answer; nothing was written."),
+            "gh api -> no HTTP answer")
+    if 200 <= status < 300:
+        return _json_or_none(text)
+    remaining = headers.get("x-ratelimit-remaining")
+    if status == 429 or (status == 403 and remaining is not None and _int(remaining) == 0):
+        raise _WriteFailure(
+            "rate_limited",
+            f"GitHub's rate limit is spent for {owner}/{repo}; {subject} #{number} was not changed.",
+            f"{method.upper()} {path} -> HTTP {status}")
+    if status == 404:
+        raise _WriteFailure(
+            "not_found",
+            f"{subject.capitalize()} #{number} was not found on {owner}/{repo} (HTTP 404); "
+            "nothing was written.", f"{method.upper()} {path} -> HTTP 404")
+    if status in (401, 403):
+        raise _WriteFailure(
+            "forbidden",
+            f"the gh account is not allowed to {action} {subject} #{number} on {owner}/{repo} "
+            f"(HTTP {status}); nothing was written.", f"{method.upper()} {path} -> HTTP {status}")
+    raise _WriteFailure(
+        "upstream_error",
+        f"GitHub answered HTTP {status} while trying to {action} {subject} #{number} on "
+        f"{owner}/{repo}; nothing was written.", f"{method.upper()} {path} -> HTTP {status}")
+
+
+async def _confirm_kind(owner: str, name: str, number: int, want: str) -> None:
+    """Refuse a route aimed at the wrong kind of number before it writes.
+
+    ``/github/pr/1/comment`` on issue #1 would otherwise post to that issue's
+    conversation, because both are issues to the REST API. One GET of
+    ``/issues/{number}``: the ``pull_request`` key is GitHub's own answer.
+    """
+    client = _GitHub(owner, name, "gh", None)
+    try:
+        response = await client.rest(f"/repos/{owner}/{name}/issues/{number}")
+    except _UpstreamError as exc:
+        if exc.status == 404:
+            raise _WriteFailure(
+                "not_found",
+                f"#{number} was not found on {owner}/{name} (HTTP 404); nothing was written.") from exc
+        raise _WriteFailure(
+            "upstream_error",
+            f"GitHub could not confirm #{number} on {owner}/{name} "
+            f"(HTTP {exc.status or 'no status'}); nothing was written.") from exc
+    data = response.data if isinstance(response.data, dict) else {}
+    actual = "pr" if isinstance(data.get("pull_request"), dict) else "issue"
+    if actual != want:
+        raise _WriteFailure(
+            "not_found",
+            f"#{number} on {owner}/{name} is "
+            f"{'a pull request' if actual == 'pr' else 'an issue'}, not "
+            f"{'a pull request' if want == 'pr' else 'an issue'}.")
+
+
+async def _write_repo(path: str) -> Union[tuple[str, str], dict[str, Any]]:
+    """``(owner, name)`` for a write route's folder, or the failure payload.
+
+    A bad folder keeps the read routes' own codes (``folder_missing``,
+    ``not_a_repo``, ``no_remote``), because a path that is wrong is not a GitHub
+    answer and the sentence says which folder it was.
+    """
+    try:
+        folder = _resolve_folder(path)
+    except _FolderMissing as exc:
+        return {"ok": False, "code": "folder_missing",
+                "error": f"Folder not found: {exc.path}", "detail": exc.path}
+    ctx = await _repo_context(folder)
+    if ctx.code != "ok" or not ctx.owner or not ctx.repo:
+        return {"ok": False, "code": ctx.code,
+                "error": ctx.error or f"No GitHub remote on {folder}.",
+                "detail": ctx.detail}
+    return ctx.owner, ctx.repo
+
+
+def _not_signed_in() -> dict[str, Any]:
+    return {"ok": False, "code": "forbidden",
+            "error": "GitHub writes run as the gh CLI's account and gh is not signed in. "
+                     "Run gh auth login, then retry."}
+
+
+async def _post_comment(number: int, path: str, payload: Mapping[str, Any],
+                        kind: str) -> dict[str, Any]:
+    """One comment on an issue or a pull request, as the gh account."""
+    raw_body = payload.get("body")
+    text = raw_body if isinstance(raw_body, str) else ""
+    if not text.strip():
+        # Checked before any folder or network call: an empty comment never leaves.
+        return {"ok": False, "code": "empty_comment",
+                "error": "A comment needs text: the body was empty or whitespace, "
+                         "so nothing was sent."}
+    repo = await _write_repo(path)
+    if isinstance(repo, dict):
+        return repo
+    owner, name = repo
+    if await _gh_user() is None:
+        return _not_signed_in()
+    subject = "pull request" if kind == "pr" else "issue"
+    try:
+        await _confirm_kind(owner, name, number, kind)
+        data = await _gh_write("POST", f"/repos/{owner}/{name}/issues/{number}/comments",
+                               {"body": text}, subject=subject, action="comment on",
+                               owner=owner, repo=name, number=number)
+    except _WriteFailure as exc:
+        log.info("project-command-center: comment write failed: %s", exc.error)
+        return _write_failure(exc)
+    _cache_drop(owner, name)
+    raw = data if isinstance(data, dict) else {}
+    return {"ok": True, "comment": {
+        "id": _int(raw.get("id")),
+        "author": _login(raw.get("user")),
+        "body": str(raw.get("body") or text),
+        "created_at": raw.get("created_at"),
+    }}
+
+
+async def _set_state(number: int, path: str, payload: Mapping[str, Any],
+                     kind: str) -> dict[str, Any]:
+    """Open or close one issue or pull request, as the gh account."""
+    value = payload.get("state")
+    state = value.strip().lower() if isinstance(value, str) else ""
+    if state not in ("open", "closed"):
+        received = str(value)[:40] if value is not None else "nothing"
+        return {"ok": False, "code": "bad_state",
+                "error": f'state must be "open" or "closed", not {received}; nothing was changed.'}
+    repo = await _write_repo(path)
+    if isinstance(repo, dict):
+        return repo
+    owner, name = repo
+    if await _gh_user() is None:
+        return _not_signed_in()
+    subject = "pull request" if kind == "pr" else "issue"
+    action = "close" if state == "closed" else "reopen"
+    try:
+        await _confirm_kind(owner, name, number, kind)
+        data = await _gh_write("PATCH", f"/repos/{owner}/{name}/issues/{number}",
+                               {"state": state}, subject=subject, action=action,
+                               owner=owner, repo=name, number=number)
+    except _WriteFailure as exc:
+        log.info("project-command-center: state write failed: %s", exc.error)
+        return _write_failure(exc)
+    _cache_drop(owner, name)
+    written = data.get("state") if isinstance(data, dict) else None
+    return {"ok": True, "state": str(written or state).lower()}
+
+
+# --- Icons -------------------------------------------------------------------
+#
+# "What is the best icon for this folder", answered without asking the user: a
+# fixed list of candidate paths, a magic byte sniff (never the extension), then a
+# narrow remote fallback, then a stack key the Desktop maps to a glyph.
+#
+# Local is deliberately not a tree walk. The sibling DMS plugin walks the whole
+# project looking for an image; on a node_modules sized folder that is seconds of
+# syscalls per card. Here every path is built from ICON_ROOTS x ICON_NAMES, so the
+# worst case is 13 * 7 stats and nothing is entered recursively.
+
+ICON_TTL = 300.0
+ICON_REMOTE_TTL = 3600.0
+ICON_MAX_BYTES = 96 * 1024
+ICON_REMOTE_MAX_BYTES = 256 * 1024
+ICON_REMOTE_TIMEOUT = 2.0
+ICON_MAX_REDIRECTS = 2
+ICON_MAX_ROOT_DEPTH = 3
+ICON_ROOTS = (".", "public", "static", "assets", "app", "src", "resources",
+              "frontend/public", "frontend/static", "frontend/app", "web/public",
+              "docs", ".github")
+ICON_NAMES = ("favicon.svg", "favicon.png", "favicon.ico", "logo.svg", "logo.png",
+              "icon.png", "app-icon.png")
+# One level down, for a Laravel app whose front end is a sibling folder.
+ICON_FRONTEND_DIRS = ("frontend", "web", "client", "apps", "ui")
+ICON_KILL_FILENAME = "icons_remote.off"
+ICON_UA = (f"project-command-center/{PLUGIN_VERSION} "
+           "(+https://github.com/NyllRE/project-command-center)")
+
+
+def _icon_mime(data: bytes) -> Optional[str]:
+    """The sniffed content type, or None when *data* is not one of six images.
+
+    The extension says nothing: an HTML error page saved as ``favicon.ico`` is
+    HTML, and must fall through to the next candidate instead of becoming a
+    broken ``<img>``.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"GIF8"):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"\x00\x00\x01\x00"):
+        return "image/x-icon"
+    head = data.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head[:5].lower() == b"<?xml" or head[:4].lower() == b"<svg":
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if "<svg" in text.lower():
+            return "image/svg+xml"
+    return None
+
+
+def _icon_label(root: str, name: str) -> str:
+    return name if root == "." else f"{root}/{name}"
+
+
+def _icon_paths(folder: Path):
+    """The whole candidate space: fixed roots, fixed names, in priority order."""
+    for root in ICON_ROOTS:
+        if len(Path(root).parts) > ICON_MAX_ROOT_DEPTH:
+            continue
+        base = folder if root == "." else folder / root
+        for name in ICON_NAMES:
+            yield base / name, _icon_label(root, name)
+
+
+def _icon_data_url(data: bytes, mime: str) -> str:
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _icon_local(folder: Path, *, refresh: bool) -> Optional[dict[str, Any]]:
+    """First local candidate that sniffs as an image, keyed by its own mtime.
+
+    A negative answer is cached too (``icon-local-miss``) so a project with no
+    image does not cost 91 stats on every card render; both expire in 300 s and
+    ``refresh=1`` bypasses them.
+    """
+    miss_key = ("icon-local-miss", str(folder))
+    if not refresh and _cache_hit(miss_key) is not None:
+        return None
+    for path, label in _icon_paths(folder):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if not stat.st_size or stat.st_size > ICON_MAX_BYTES or not path.is_file():
+            continue
+        key = ("icon-local", str(folder), str(path), stat.st_mtime_ns)
+        if not refresh:
+            cached = _cache_hit(key)
+            if cached is not None:
+                return cached
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if len(data) > ICON_MAX_BYTES:
+            continue
+        mime = _icon_mime(data)
+        if mime is None:
+            log.debug("icon: %s is not an image, next candidate", path)
+            continue
+        payload = {"ok": True, "kind": "image", "data_url": _icon_data_url(data, mime),
+                   "mime": mime, "source": "local", "detail": label}
+        _cache_put(key, payload, ttl=ICON_TTL)
+        return payload
+    if not refresh:
+        _cache_put(miss_key, {}, ttl=ICON_TTL)
+    return None
+
+
+def _icon_stack(folder: Path) -> str:
+    """A fixed key for the card's glyph: the folder's root markers, in order."""
+    if (folder / "composer.json").is_file() and (folder / "artisan").is_file():
+        return "laravel"
+    if any(folder.glob("nuxt.config.*")):
+        return "nuxt"
+    if (folder / "package.json").is_file():
+        return "node"
+    if (folder / "pyproject.toml").is_file() or (folder / "setup.py").is_file():
+        return "python"
+    if (folder / "Cargo.toml").is_file():
+        return "rust"
+    if (folder / "go.mod").is_file():
+        return "go"
+    if (folder / "flake.nix").is_file() or (folder / "default.nix").is_file():
+        return "nix"
+    if (folder / ".obsidian").is_dir():
+        return "obsidian"
+    if (folder / "Dockerfile").is_file() or (folder / "docker-compose.yml").is_file():
+        return "docker"
+    if (folder / "mkdocs.yml").is_file() or (folder / "docs" / "conf.py").is_file():
+        return "docs"
+    for name in ICON_FRONTEND_DIRS:
+        base = folder / name
+        if any(base.glob("nuxt.config.*")):
+            return "nuxt"
+        if (base / "package.json").is_file():
+            return "node"
+    return "git"
+
+
+def _icon_kill_file() -> Path:
+    """``<hermes home>/plugin-data/project-command-center/icons_remote.off``."""
+    from plugins.plugin_storage import plugin_data_dir
+
+    return plugin_data_dir(PLUGIN_NAME) / ICON_KILL_FILENAME
+
+
+def _icon_remote_off() -> bool:
+    """True when the remote fallback is switched off. Checked on every call.
+
+    Deliberately not cached at import: creating the file takes effect on the next
+    request. A data directory that cannot be resolved counts as off, the same rule
+    ``hooks.py`` uses for ``auto_link.off``: a fetch whose kill switch cannot be
+    proven absent must not happen.
+    """
+    try:
+        return _icon_kill_file().exists()
+    except Exception:
+        log.debug("icon: kill file unreadable, treating remote lookup as off", exc_info=True)
+        return True
+
+
+def _icon_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _icon_toml(path: Path) -> dict[str, Any]:
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python without tomllib: declared TOML URLs are skipped
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _icon_homepage(folder: Path) -> Optional[str]:
+    """The homepage a project declares about itself, or None.
+
+    Four manifests, no guessing: composer.json / package.json ``homepage``,
+    ``[project.urls] Homepage|Documentation`` in pyproject.toml, and
+    ``[package] homepage`` in Cargo.toml.
+    """
+    for name in ("composer.json", "package.json"):
+        value = _icon_json(folder / name).get("homepage")
+        if isinstance(value, dict):
+            value = value.get("url")
+        if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+            return value.strip()
+    project = _icon_toml(folder / "pyproject.toml").get("project")
+    urls = project.get("urls") if isinstance(project, dict) else None
+    if isinstance(urls, dict):
+        for wanted in ("homepage", "documentation"):
+            for key, value in urls.items():
+                if str(key).lower() == wanted and isinstance(value, str) \
+                        and value.strip().startswith(("http://", "https://")):
+                    return value.strip()
+    package = _icon_toml(folder / "Cargo.toml").get("package")
+    value = package.get("homepage") if isinstance(package, dict) else None
+    if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+        return value.strip()
+    return None
+
+
+def _icon_home_urls(homepage: str) -> list[str]:
+    """``https://<host>/favicon.ico`` then ``.png``; the declared scheme and path are ignored."""
+    try:
+        parts = urlsplit(homepage)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return []
+    if not host:
+        return []
+    origin = f"https://{host}" + (f":{port}" if port else "")
+    return [f"{origin}/favicon.ico", f"{origin}/favicon.png"]
+
+
+def _icon_ip_public(ip: Any) -> bool:
+    """Only globally routable addresses: no loopback, RFC1918, link local, CGNAT, ULA."""
+    if getattr(ip, "version", None) == 6 and ip.ipv4_mapped is not None:
+        return bool(ip.ipv4_mapped.is_global)
+    return bool(ip.is_global)
+
+
+async def _icon_host_allowed(host: str, deadline: float) -> tuple[bool, str]:
+    """Resolve *host* and refuse it unless every address is public.
+
+    Resolution happens here, before httpx opens a socket, so a name that points at
+    127.0.0.1 or a link local metadata address is rejected rather than connected.
+    """
+    name = (host or "").strip().strip(".").lower()
+    if not name or len(name) > 253:
+        return False, "empty or overlong host"
+    if name == "localhost" or name.endswith(".localhost"):
+        return False, "localhost is refused"
+    try:
+        literal = ipaddress.ip_address(name)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if _icon_ip_public(literal):
+            return True, f"{literal} is public"
+        return False, f"{literal} is not a public address"
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False, "out of time before resolution"
+    try:
+        infos = await asyncio.wait_for(
+            asyncio.to_thread(socket.getaddrinfo, name, 443, 0, socket.SOCK_STREAM),
+            timeout=remaining)
+    except asyncio.TimeoutError:
+        return False, f"{name} did not resolve within the timeout"
+    except (OSError, UnicodeError, ValueError):
+        return False, f"{name} does not resolve"
+    if not infos:
+        return False, f"{name} does not resolve"
+    for info in infos:
+        text = str(info[4][0]).split("%")[0]
+        try:
+            ip = ipaddress.ip_address(text)
+        except ValueError:
+            return False, f"{name} resolved to an unparseable address"
+        if not _icon_ip_public(ip):
+            return False, f"{name} resolves to {text}, which is not a public address"
+    return True, f"{name} resolves to a public address"
+
+
+async def _icon_url_allowed(url: str, deadline: float) -> tuple[bool, str]:
+    """https only, no userinfo, public host; every redirect hop goes through here again."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False, "unparseable url"
+    if parts.scheme.lower() != "https":
+        return False, f"{parts.scheme or 'no'} scheme is refused, only https is fetched"
+    if parts.username or parts.password:
+        return False, "credentials in the url are refused"
+    if port not in (None, 443):
+        return False, f"port {port} is refused, only the default https port is fetched"
+    return await _icon_host_allowed(parts.hostname or "", deadline)
+
+
+async def _icon_fetch(url: str, deadline: float) -> Optional[dict[str, Any]]:
+    """One image over https, at most ICON_MAX_REDIRECTS redirects, 256 KB, sniffed.
+
+    No cookies, no auth header, no proxy from the environment: the URL came out of
+    repository content, so the request carries exactly a UA and an Accept.
+    """
+    current = url
+    for hop in range(ICON_MAX_REDIRECTS + 1):
+        allowed, reason = await _icon_url_allowed(current, deadline)
+        if not allowed:
+            log.info("icon: refused %s: %s", current, reason)
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        headers = {"user-agent": ICON_UA, "accept": "image/*"}
+        try:
+            async with httpx.AsyncClient(follow_redirects=False, trust_env=False,
+                                         timeout=httpx.Timeout(remaining),
+                                         headers=headers) as client:
+                async with client.stream("GET", current) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        location = response.headers.get("location")
+                        if not location or hop == ICON_MAX_REDIRECTS:
+                            return None
+                        current = urljoin(current, location)
+                        continue
+                    if response.status_code != 200:
+                        return None
+                    data = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        data.extend(chunk)
+                        if len(data) > ICON_REMOTE_MAX_BYTES or time.monotonic() > deadline:
+                            return None
+        except (httpx.HTTPError, OSError, ValueError):
+            return None
+        mime = _icon_mime(bytes(data))
+        if mime is None:
+            return None
+        return {"ok": True, "kind": "image", "data_url": _icon_data_url(bytes(data), mime),
+                "mime": mime, "source": "remote", "detail": current}
+    return None
+
+
+async def _icon_remote(folder: Path, *, refresh: bool) -> Optional[dict[str, Any]]:
+    """Declared homepage first, then the GitHub owner avatar. One 2 s budget."""
+    deadline = time.monotonic() + ICON_REMOTE_TIMEOUT
+    candidates: list[tuple[str, str]] = []
+    homepage = _icon_homepage(folder)
+    if homepage:
+        candidates.extend((url, "homepage") for url in _icon_home_urls(homepage))
+    try:
+        root = await _work_tree(folder)
+        remote = await _primary_remote(root) if root else ""
+    except (TimeoutError, _GitError):
+        remote = ""
+    owner, _repo = _parse_remote(remote)
+    if owner:
+        candidates.append((f"https://github.com/{owner}.png?size=64", "avatar"))
+    for url, source in candidates:
+        key = ("icon-remote", str(folder), source, url)
+        if not refresh:
+            cached = _cache_hit(key)
+            if cached is not None:
+                return cached
+        result = await _icon_fetch(url, deadline)
+        if result is not None:
+            _cache_put(key, result, ttl=ICON_REMOTE_TTL)
+            return result
+        if time.monotonic() >= deadline:
+            break
+    return None
+
+
+async def _icon_answer(folder: Path, *, refresh: bool) -> dict[str, Any]:
+    """Local image, else remote image, else the stack glyph. Never raises for a folder."""
+    local = _icon_local(folder, refresh=refresh)
+    if local is not None:
+        return local
+    glyph_key = ("icon-glyph", str(folder))
+    if not refresh:
+        cached = _cache_hit(glyph_key)
+        if cached is not None:
+            return cached
+    if not _icon_remote_off():
+        remote = await _icon_remote(folder, refresh=refresh)
+        if remote is not None:
+            return remote
+    payload = {"ok": True, "kind": "glyph", "stack": _icon_stack(folder), "source": "stack"}
+    _cache_put(glyph_key, payload, ttl=ICON_TTL)
+    return payload
 
 
 # --- Routes -----------------------------------------------------------------
@@ -1265,19 +2065,21 @@ async def github_pr(number: int, path: str = Query(..., description="Absolute pa
                              auth_note=gh.auth_note, auth_account=account)
     raw = detail.data if isinstance(detail.data, dict) else {}
 
-    files_response, reviews_response, timeline_response = await asyncio.gather(
+    files_response, reviews_response, timeline_response, comments_response = await asyncio.gather(
         _quiet(gh.rest(f"{base}/files", {"per_page": 100})),
         _quiet(gh.rest(f"{base}/reviews", {"per_page": 100})),
         _quiet(gh.rest(f"/repos/{owner}/{name}/issues/{number}/timeline", {"per_page": 100})),
+        _quiet(gh.rest(f"/repos/{owner}/{name}/issues/{number}/comments",
+                       {"per_page": MAX_COMMENTS, "sort": "created", "direction": "asc"})),
     )
     files = [str(f.get("filename")) for f in _as_list(files_response)
              if isinstance(f, dict) and f.get("filename")][:100]
-    reviews = [{"state": r.get("state"), "author": _login(r.get("user")),
-                "submitted_at": r.get("submitted_at")}
-               for r in _as_list(reviews_response) if isinstance(r, dict)]
+    reviews = _review_rows(_as_list(reviews_response))
+    comments = _comment_rows(_as_list(comments_response))
     timeline_issues = _timeline_refs(_as_list(timeline_response))[1]
 
-    row = _pull_row(raw, (await _enrich_pulls(gh, [number])).get(number))
+    node = (await _enrich_pulls(gh, [number])).get(number)
+    row = _pull_row(raw, node)
     linked = sorted(set(row["linked_issues"]) | set(timeline_issues))
     account = await _account_name(gh, token) if gh.auth_note else None
     payload = {
@@ -1286,8 +2088,13 @@ async def github_pr(number: int, path: str = Query(..., description="Absolute pa
         "auth_note": gh.auth_note, "auth_account": account,
         **row, "linked_issues": linked,
         "body": raw.get("body") or "",
+        "state_reason": raw.get("state_reason"),
         "files_changed": files,
         "reviews": reviews,
+        "comments": comments,
+        # None, not {"state": "none"}, when the GraphQL pass could not answer:
+        # the modal shows a checks row only for a real rollup.
+        "checks": row["checks"] if node is not None else None,
         "comments_count": _int(raw.get("comments")),
         "timeline_linked_issues": timeline_issues,
     }
@@ -1322,9 +2129,13 @@ async def github_issue(number: int, path: str = Query(..., description="Absolute
                              exc.detail, owner=owner, repo=name, auth=gh.auth,
                              auth_note=gh.auth_note, auth_account=account)
     raw = detail.data if isinstance(detail.data, dict) else {}
-    timeline = _as_list(await _quiet(
-        gh.rest(f"/repos/{owner}/{name}/issues/{number}/timeline", {"per_page": 100})))
-    timeline_pulls = _timeline_refs(timeline)[0]
+    timeline_response, comments_response = await asyncio.gather(
+        _quiet(gh.rest(f"/repos/{owner}/{name}/issues/{number}/timeline", {"per_page": 100})),
+        _quiet(gh.rest(f"/repos/{owner}/{name}/issues/{number}/comments",
+                       {"per_page": MAX_COMMENTS, "sort": "created", "direction": "asc"})),
+    )
+    timeline_pulls = _timeline_refs(_as_list(timeline_response))[0]
+    comments = _comment_rows(_as_list(comments_response))
     account = await _account_name(gh, token) if gh.auth_note else None
     payload = {
         "ok": True, "code": "ok", "error": None, "detail": None,
@@ -1333,9 +2144,11 @@ async def github_issue(number: int, path: str = Query(..., description="Absolute
         "number": number,
         "title": str(raw.get("title") or ""),
         "state": str(raw.get("state") or "open"),
+        "state_reason": raw.get("state_reason"),
         "author": _login(raw.get("user")),
         "labels": _names(raw.get("labels"), "name"),
         "assignees": _names(raw.get("assignees"), "login"),
+        "comments": comments,
         "comments_count": _int(raw.get("comments")),
         "created_at": raw.get("created_at"),
         "updated_at": raw.get("updated_at"),
@@ -1345,6 +2158,244 @@ async def github_issue(number: int, path: str = Query(..., description="Absolute
     }
     _cache_put(key, payload)
     return payload
+
+
+def _ref_numbers(raw: str) -> list[int]:
+    """Numbers from ``numbers=1,2,3``: digits only, ``#`` tolerated, de-duplicated, MAX_REFS wide."""
+    out: list[int] = []
+    for piece in (raw or "").split(","):
+        text = piece.strip().lstrip("#")
+        if not text.isdigit():
+            continue
+        number = _int(text)
+        if number > 0 and number not in out:
+            out.append(number)
+        if len(out) >= MAX_REFS:
+            break
+    return out
+
+
+@router.get("/github/refs")
+async def github_refs(path: str = Query(..., description="Absolute path to the project folder"),
+                      numbers: str = Query("", description="Comma separated issue or PR numbers"),
+                      refresh: int = Query(0, ge=0, le=1)) -> dict[str, Any]:
+    """Resolve ``#number`` chips: one batched GraphQL call, up to MAX_REFS numbers.
+
+    ``refs`` is keyed by the number as a string: ``{number, kind: "issue"|"pr",
+    title, state, author, updated_at, url}``. A number that does not exist is
+    left out instead of guessed, and a merged PR reports ``closed``. Cache 60 s
+    like every other read; ``refresh=1`` bypasses it.
+    """
+    wanted = _ref_numbers(numbers)
+    if not wanted:
+        return {"ok": True, "refs": {}}
+    try:
+        folder = _resolve_folder(path)
+    except _FolderMissing as exc:
+        return {"ok": False, "code": "folder_missing",
+                "error": f"Folder not found: {exc.path}", "detail": exc.path}
+    ctx = await _repo_context(folder)
+    if ctx.code != "ok" or not ctx.owner or not ctx.repo:
+        return {"ok": False, "code": ctx.code, "error": ctx.error, "detail": ctx.detail}
+    owner, name = ctx.owner, ctx.repo
+    mode, token = await _auth()
+    key = ("refs", owner.lower(), name.lower(), tuple(wanted), mode)
+    if not refresh and (hit := _cache_hit(key)) is not None:
+        return hit
+    if mode == "none":
+        return {"ok": False, "code": "no_auth",
+                "error": "Resolving #numbers needs a GitHub login: set GITHUB_TOKEN or run "
+                         "gh auth login.",
+                "detail": "GET /github/refs -> no credential"}
+
+    gh = _GhReader(owner, name, mode, token)
+    query, variables = _refs_query(owner, name, wanted)
+    try:
+        # partial: a number that does not exist comes back as a NOT_FOUND error
+        # beside the data, and that is the "omit it" case, not a failed read.
+        data = await gh.graphql(query, variables, partial=True)
+    except _UpstreamError as exc:
+        account = await _account_name(gh, token)
+        log.warning("project-command-center: refs lookup failed for %s/%s: %s", owner, name, exc)
+        return {"ok": False, "code": exc.code,
+                "error": _github_sentence(exc, owner, name, account), "detail": exc.detail}
+    if data is None:
+        return {"ok": False, "code": "upstream_error",
+                "error": f"GitHub did not answer the reference lookup for {owner}/{name}.",
+                "detail": "POST /graphql -> no data"}
+
+    def parse(payload: Optional[dict[str, Any]]) -> dict[str, RefRow]:
+        repository = (payload or {}).get("repository")
+        if not isinstance(repository, dict):
+            return {}
+        found: dict[str, RefRow] = {}
+        for index, number in enumerate(wanted):
+            node = repository.get(f"r{index}")
+            if not isinstance(node, dict):
+                continue  # GitHub has no such number: omitted, never invented
+            state = str(node.get("state") or "").lower()
+            found[str(number)] = {
+                "number": _int(node.get("number")) or number,
+                "kind": "pr" if str(node.get("__typename") or "") == "PullRequest" else "issue",
+                "title": str(node.get("title") or ""),
+                "state": "closed" if state in ("closed", "merged") else "open",
+                "author": _login(node.get("author")),
+                "updated_at": node.get("updatedAt"),
+                "url": node.get("url"),
+            }
+        return found
+
+    refs = parse(data)
+
+    # A token that cannot see the repository answers ``repository: null`` with a
+    # NOT_FOUND beside it, which ``partial`` swallows as "no such number". That is
+    # the board's original blind spot: retry the whole batch through ``gh`` once.
+    repository_missing = not isinstance((data or {}).get("repository"), dict)
+    if repository_missing and mode == "token" and shutil.which("gh") is not None:
+        try:
+            data = await _GitHub(owner, name, "gh", None).graphql(query, variables, partial=True)
+            refs = parse(data)
+            repository_missing = not isinstance((data or {}).get("repository"), dict)
+        except _UpstreamError as exc:
+            log.warning("project-command-center: refs gh retry failed for %s/%s: %s", owner, name, exc)
+
+    if not refs and repository_missing:
+        return {"ok": False, "code": "repo_not_found",
+                "error": f"GitHub could not read {owner}/{name} for reference lookup: the configured "
+                         f"credential cannot see the repository and gh did not answer.",
+                "detail": "POST /graphql -> repository null"}
+
+    payload: dict[str, Any] = {"ok": True, "refs": refs}
+    _cache_put(key, payload)
+    return payload
+
+
+@router.get("/github/counts")
+async def github_counts(path: list[str] = Query(
+                            default=[], description="Absolute path to a project folder; repeat the parameter"),
+                        refresh: int = Query(0, description="1 bypasses the 60 s cache")) -> dict[str, Any]:
+    """Open issue and open PR counts for up to MAX_COUNT_PATHS folders, one call.
+
+    ``counts`` is keyed by the path as requested: ``{owner, repo, issues_open,
+    prs_open}``. A folder with no GitHub remote, a folder that is gone, and a
+    repository this credential cannot read are all left out of ``counts``: a
+    zero here always means zero open items, never "unknown". Two folders on the
+    same repository share one alias, so the whole board costs one GraphQL call.
+    Cache 60 s keyed by the sorted path list; ``refresh=1`` bypasses it.
+    """
+    requested: list[str] = []
+    for raw in path or []:
+        text = str(raw or "").strip()
+        if text and text not in requested:
+            requested.append(text)
+            if len(requested) >= MAX_COUNT_PATHS:
+                break
+    if not requested:
+        return {"ok": False, "code": "no_paths",
+                "error": "Pass at least one absolute folder as path.",
+                "detail": "GET /github/counts -> no path"}
+
+    mode, token = await _auth()
+    key = ("ghcounts", tuple(sorted(requested)), mode)
+    if not refresh and (hit := _cache_hit(key)) is not None:
+        return hit
+    if mode == "none":
+        # No credential: every repository is unreadable, so every folder is absent.
+        payload: dict[str, Any] = {"ok": True, "cached": False, "counts": {}}
+        _cache_put(key, payload)
+        return payload
+
+    folders: list[tuple[str, str, str]] = []  # (requested path, owner, repo)
+    aliases: dict[tuple[str, str], tuple[str, str]] = {}
+    for text in requested:
+        if not Path(text).is_absolute():
+            continue  # a relative path names nothing this route can count: absent
+        try:
+            folder = _resolve_folder(text)
+        except _FolderMissing:
+            continue  # gone from disk: absent, never an error for the whole batch
+        ctx = await _repo_context(folder)
+        if ctx.code != "ok" or not ctx.owner or not ctx.repo:
+            continue  # no remote, or not a repo: absent
+        folders.append((text, ctx.owner, ctx.repo))
+        aliases.setdefault((ctx.owner.lower(), ctx.repo.lower()), (ctx.owner, ctx.repo))
+    if not aliases:
+        payload = {"ok": True, "cached": False, "counts": {}}
+        _cache_put(key, payload)
+        return payload
+
+    wanted = list(aliases.values())
+    owner, name = wanted[0]
+    gh = _GhReader(owner, name, mode, token)
+    query, variables = _counts_query(wanted)
+    try:
+        # partial: a repository this credential cannot read comes back as a null
+        # alias with a NOT_FOUND beside it, and that is the "leave it out" case.
+        data = await gh.graphql(query, variables, partial=True)
+    except _UpstreamError as exc:
+        account = await _account_name(gh, token)
+        log.warning("project-command-center: counts lookup failed: %s", exc)
+        return {"ok": False, "code": exc.code,
+                "error": _github_sentence(exc, owner, name, account),
+                "detail": exc.detail, "counts": {}}
+
+    totals: dict[tuple[str, str], dict[str, Any]] = {}
+    for index, (repo_owner, repo_name) in enumerate(wanted):
+        node = (data or {}).get(f"r{index}")
+        if not isinstance(node, dict):
+            continue  # unreadable or gone: omitted, so no zero is read as a fact
+        issues_raw, pulls_raw = node.get("issues"), node.get("pullRequests")
+        issues: dict[str, Any] = issues_raw if isinstance(issues_raw, dict) else {}
+        pulls: dict[str, Any] = pulls_raw if isinstance(pulls_raw, dict) else {}
+        totals[(repo_owner.lower(), repo_name.lower())] = {
+            "owner": repo_owner, "repo": repo_name,
+            "issues_open": _int(issues.get("totalCount")),
+            "prs_open": _int(pulls.get("totalCount")),
+        }
+
+    counts = {text: totals[(path_owner.lower(), path_name.lower())]
+              for text, path_owner, path_name in folders
+              if (path_owner.lower(), path_name.lower()) in totals}
+    payload = {"ok": True, "cached": False, "counts": counts}
+    _cache_put(key, payload)
+    return payload
+
+
+@router.post("/github/issue/{number}/comment")
+async def github_issue_comment(number: int, path: str = Query(...),
+                               payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """``{"body": "markdown"}`` -> ``{"ok": true, "comment": {id, author, body, created_at}}``.
+
+    The text goes to ``gh api`` on stdin, so quotes and newlines survive intact.
+    An empty or whitespace only body is ``empty_comment`` before any folder or
+    network call; a missing number is ``not_found``. HTTP 200 either way.
+    """
+    return await _post_comment(number, path, payload, "issue")
+
+
+@router.post("/github/pr/{number}/comment")
+async def github_pr_comment(number: int, path: str = Query(...),
+                            payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Comment on a pull request's conversation, same body and answer as the issue route.
+
+    The number is confirmed to be a pull request first: GitHub's comment endpoint
+    would otherwise happily comment on an issue with the same number.
+    """
+    return await _post_comment(number, path, payload, "pr")
+
+
+@router.post("/github/issue/{number}/state")
+async def github_issue_state(number: int, path: str = Query(...),
+                             payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """``{"state": "open"|"closed"}`` -> ``{"ok": true, "state": ...}``; else ``bad_state``."""
+    return await _set_state(number, path, payload, "issue")
+
+
+@router.post("/github/pr/{number}/state")
+async def github_pr_state(number: int, path: str = Query(...),
+                          payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Open or close a pull request; the number must be a PR, not an issue."""
+    return await _set_state(number, path, payload, "pr")
 
 
 # --- Diagnose ---------------------------------------------------------------
@@ -1481,6 +2532,35 @@ async def diagnose(path: str = Query(..., description="Absolute path to the proj
                "authenticated": bool(gh_user), "user": gh_user, "error": gh_error},
         "probe": probe,
     }
+
+
+@router.get("/icon")
+async def icon(path: str = Query(..., description="Absolute path to the project folder"),
+                refresh: int = Query(0, ge=0, le=1)) -> dict[str, Any]:
+    """The best icon for a project folder: a local image, a remote one, or a stack key.
+
+    Always HTTP 200 for a well formed request. Three answers:
+    ``kind: "image"`` with a ``data:`` URL whose mime was sniffed from the bytes and
+    whose ``detail`` names the file or URL, ``kind: "glyph"`` with a ``stack`` key
+    (``laravel``, ``nuxt``, ``node``, ``python``, ``rust``, ``go``, ``nix``,
+    ``obsidian``, ``docker``, ``docs``, ``git``) when nothing was found, and
+    ``ok: false`` with a code for a folder that is gone or malformed. ``refresh=1``
+    bypasses the local (300 s), remote (3600 s) and glyph (300 s) caches.
+    """
+    try:
+        folder = _resolve_folder(path)
+    except _FolderMissing as exc:
+        return {"ok": False, "code": "folder_missing", "error": f"Folder not found: {exc.path}"}
+    except HTTPException as exc:
+        return {"ok": False, "code": "bad_path", "error": str(exc.detail)}
+    try:
+        result = await _icon_answer(folder, refresh=bool(refresh))
+    except Exception as exc:  # a card must render even if a manifest or a socket misbehaves
+        log.warning("icon: %s failed: %s", folder, exc, exc_info=True)
+        return {"ok": False, "code": "icon_error",
+                "error": f"the icon for {folder.name} could not be resolved: {type(exc).__name__}"}
+    result.setdefault("cached", False)
+    return result
 
 
 # --- Board state -------------------------------------------------------------

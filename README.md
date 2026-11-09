@@ -2,6 +2,8 @@
 
 Every project you are working on, in one board: its sessions, its lane, its git state, and the GitHub issues and pull requests that belong to it. Click an issue and a chat about it opens in that project's folder with the issue already sitting in the composer.
 
+![Project Command Center](docs/covers/cover-final.png)
+
 <!-- screenshot: docs/board.png once the board capture lands -->
 
 ## Why
@@ -22,7 +24,7 @@ Hermes already knows which project a session belongs to, what branch it is on an
 Shipped as one installable folder:
 
 - `desktop/plugin.js`, the Desktop half: titlebar button, the board page at `/project-command-center`, and the project detail page with a stats strip and sessions grouped by lane.
-- `dashboard/plugin_api.py`, the Python half: git and GitHub reads for a project folder plus the board store routes, mounted at `/api/plugins/project-command-center/` and reached from the Desktop half with `ctx.rest`.
+- `dashboard/plugin_api.py`, the Python half: git and GitHub reads for a project folder, the board store routes, and the four GitHub writes (a comment, open/closed), mounted at `/api/plugins/project-command-center/` and reached from the Desktop half with `ctx.rest`.
 - `board_store.py`, the shared state: one local SQLite file holding each project's lane, each session's project and work item, and the project ids the board knows.
 - `__init__.py`, the agent half: three tools (`pcc_board`, `pcc_set_status`, `pcc_work_item`) over the same store, in the `project_command_center` toolset.
 
@@ -58,8 +60,15 @@ The git, GitHub and diagnose routes read. The `/board` routes read and write the
 | `GET /health` | `ok`, `version`, `gh: {available, authenticated, user}`, `token` (bool, never the value), `isolation_note` |
 | `GET /repo?path=<abs folder>` | `path`, `root`, `remote`, `owner`, `repo`, `branch`, `detached`, `dirty: {count, staged, unstaged, untracked}`, `ahead`, `behind`, `branches: [{name, upstream, ahead, behind, last_commit_at, subject}]`, `error` |
 | `GET /github?path=<abs folder>&state=open&limit=50&refresh=0` | `repo`, `owner`, `url`, `fetched_at`, `cached`, `auth`, `rate_limit`, `issues[]`, `prs[]`, `counts`, `updated_at`, `error` |
-| `GET /github/pr/{number}?path=<abs folder>` | one PR: the list row fields plus `body`, `files_changed` (first 100 names), `reviews`, `comments_count`, `linked_issues`, `timeline_linked_issues` |
-| `GET /github/issue/{number}?path=<abs folder>` | one issue: `body`, `labels`, `assignees`, `comments_count`, `timeline_prs`, `linked_prs` |
+| `GET /github/pr/{number}?path=<abs folder>` | one PR: the list row fields plus `body`, `state_reason`, `author`, `files_changed` (first 100 names), `reviews: [{author, state, body, submitted_at}]`, `comments: [{id, author, body, created_at, updated_at, url}]`, `checks` (`{state, total, failing}` or `null` when the rollup could not be read), `comments_count`, `linked_issues`, `timeline_linked_issues` |
+| `GET /github/issue/{number}?path=<abs folder>` | one issue: `body`, `state`, `state_reason`, `created_at`, `author`, `labels`, `assignees`, `comments: [{id, author, body, created_at, updated_at, url}]`, `comments_count`, `timeline_prs`, `linked_prs` |
+| `GET /github/refs?path=<abs folder>&numbers=1,2,3` | `refs`, keyed by number: `{number, kind: "issue"\|"pr", title, state, author, updated_at, url}`. Up to 50 numbers in one batched GraphQL call; a number that does not exist is left out |
+| `GET /github/counts?path=<abs folder>&path=<abs folder>...` | `counts`, keyed by the path as passed: `{owner, repo, issues_open, prs_open}` for up to 50 folders in one batched GraphQL call, one alias per repository and folders on the same repository deduplicated. A folder with no GitHub remote, a folder that is gone, or a repository this credential cannot read is left out of `counts`, never returned as a zero; `cached`, 60 s, `refresh=1` bypasses |
+| `POST /github/issue/{number}/comment?path=<abs folder>` | body `{body}` → `{ok, comment: {id, author, body, created_at}}`, else `{ok: false, code, error}` |
+| `POST /github/pr/{number}/comment?path=<abs folder>` | same, on the PR's conversation; the number must be a pull request |
+| `POST /github/issue/{number}/state?path=<abs folder>` | body `{state: "open"\|"closed"}` → `{ok, state}` |
+| `POST /github/pr/{number}/state?path=<abs folder>` | same, for a pull request |
+| `GET /icon?path=<abs folder>&refresh=0` | `kind: "image"` with `data_url`, `mime`, `source: "local"` and `detail` (the relative file), or `kind: "glyph"` with `stack` and `source: "stack"`, or `{ok: false, code, error}`; always HTTP 200 |
 | `GET /board?session_id=` | `statuses[]`, `links[]`, `projects_synced`, `auto_link: {session_id, project_id, via, cwd}` |
 | `POST /board/status` | body `{project_id, status, note?}` → the written `status` row |
 | `POST /board/link` | body `{session_id, project_id, repo, issue?, pr?, title?, pr_url?}` → the written `link` row |
@@ -68,13 +77,15 @@ The git, GitHub and diagnose routes read. The `/board` routes read and write the
 
 `issues[]` excludes pull requests even though GitHub returns PRs from its issues endpoint. `prs[].head_ref` is returned verbatim because it is the key the Desktop half joins sessions on (`session.git_branch`).
 
+The four write routes answer HTTP 200 in every normal case, success or not, and never a 500. A failure is `{ok: false, code, error}` with `error` one sentence: `empty_comment` (the body was empty or whitespace, rejected before any folder or network call), `bad_state` (anything but `open`/`closed`), `not_found` (no such number, or the number is the wrong kind for the route), `forbidden` (the gh account may not write there, or gh is not signed in), `rate_limited`, `upstream_error`. A folder that is wrong keeps the read routes' own codes (`folder_missing`, `not_a_repo`, `no_remote`). Writes run as the authenticated `gh` CLI account, never as `GITHUB_TOKEN`, and the request body is handed to `gh api --input -` on stdin, so a comment with quotes, backticks, `$( )` or newlines arrives byte for byte. A successful write drops that repo's cached reads so the next detail fetch shows it.
+
 ### Linking
 
 PR to issue links come from GitHub's own answer, GraphQL `closingIssuesReferences`, and are merged with the `closes #12` / `fixes #12` / `refs #12` keyword fallback parsed from the title and body. Issue to PR is the same map read backwards, taken from the board cache, plus the issue timeline's `cross-referenced` events. The PR detail also reports `timeline_linked_issues` from its own timeline, and the issue detail reports `timeline_prs` the same way.
 
 ### Caching
 
-One in process cache keyed by (owner, repo, endpoint, params), 60 s TTL, 20 s for `/repo`. With a token or `gh` login the board read revalidates with the stored ETag: a 304 extends the TTL and returns the cached payload instead of refetching four times. `refresh=1` bypasses the cache.
+One in process cache keyed by (owner, repo, endpoint, params), 60 s TTL, 20 s for `/repo`. With a token or `gh` login the board read revalidates with the stored ETag: a 304 extends the TTL and returns the cached payload instead of refetching four times. `refresh=1` bypasses the cache. `/github/refs` is cached the same 60 s, keyed by the exact number list, so a modal that re-renders its chips makes no call. A successful GitHub write drops every cached read for that repo.
 
 GraphQL resolves one pull request per alias at roughly 0.6 s on a busy repository, so the board enriches the 10 most recently updated PRs per page; `prs[].enriched` marks them. Rows past that window carry the REST fields (state, draft, refs, keyword links) and `enriched: false`, and the review and check counters in `counts` cover the enriched window only.
 
@@ -137,12 +148,20 @@ The section degrades in three steps: a payload `{error}` (no remote, no auth, ra
 
 `GITHUB_TOKEN` is optional and declared under `optional_env`. It is read with `agent.secret_scope.get_secret("GITHUB_TOKEN")` inside the request handler, never from `os.environ` directly, so a profile scope or multiplexing gateway resolves it correctly. With no token the backend falls back to the user's own authenticated `gh` CLI. With neither, public reads still work unauthenticated, and a private read reports `auth: "none"` with GitHub's error message. No credential file (`.env`, `auth.json`, `~/.config/gh/hosts.yml`) is opened by this plugin.
 
+Reads use the token when one is set. **Writes never do**: the four write routes call `gh` and nothing else, so a comment or a close is posted as the account `gh auth status` names, and with no signed in `gh` they answer `forbidden` instead of falling back to the token.
+
 ## What it runs, and what it reads (disclosure)
 
-- `git` subprocesses with no shell and a 5 s timeout: `rev-parse`, `symbolic-ref`, `status --porcelain`, `for-each-ref`, `rev-list --left-right --count`, `remote`, `remote get-url`. Read only commands against the absolute folder you pass; nothing writes to the repository.
-- `gh` subprocesses with no shell: `gh api -i` and `gh api graphql`, GET and query only. The child gets an allowlisted environment (PATH, HOME, locale, git config paths), so no credential variable is passed through to it.
-- `https://api.github.com` over httpx when a token is set, or unauthenticated for public reads. No other host is contacted.
-- No file contents are returned. No git, GitHub, issue, PR, comment, label or ref write exists in this plugin: the only writes are the two local ones below.
+- `git` subprocesses with no shell and a 5 s timeout: `rev-parse`, `symbolic-ref`, `status --porcelain`, `for-each-ref`, `rev-list --left-right --count`, `remote`, `remote get-url`. Read only commands against the absolute folder you pass; nothing writes to the repository. **git stays read only**: there is no `git commit`, `push`, `checkout` or `fetch` in this plugin.
+- `gh` subprocesses with no shell: `gh api -i` and `gh api graphql` for reads, and `gh api -i --method POST|PATCH --input -` for writes. The child gets an allowlisted environment (PATH, HOME, locale, git config paths), so no credential variable is passed through to it.
+- **GitHub writes (new):** exactly four routes, and they are the only things in this plugin that change anything on GitHub:
+  - `POST /github/issue/{n}/comment` and `POST /github/pr/{n}/comment` post **one comment** on that issue or pull request. The markdown you send is the comment; nothing else is added.
+  - `POST /github/issue/{n}/state` and `POST /github/pr/{n}/state` set that issue or pull request **open or closed**. Nothing is deleted, labelled, assigned, merged or edited.
+  - They run as the **authenticated `gh` CLI account** (`gh auth login`); the configured `GITHUB_TOKEN` is a read credential and is never used to write. The route confirms the number is the kind it says (a PR route will not touch an issue), and the JSON body reaches `gh` on stdin, so comment text is never quoted into a command line.
+  - They are reachable only through the plugin's own mounted API at `/api/plugins/project-command-center/`, behind the gateway's normal auth. Nothing here runs on its own: no cron, no hook, no tool calls them. A write only happens when you press something in the Desktop half.
+- `https://api.github.com` over httpx when a token is set, or unauthenticated for public reads. The GitHub routes contact no other host. Writes never take the httpx path. `GET /github/counts` puts up to 50 folders into **one** GraphQL query, aliased per repository, so a board of many projects costs one request instead of one per project.
+- `GET /icon` reads only files already in the folder you pass: a fixed list of 13 directory roots (`.`, `public`, `static`, `assets`, `app`, `src`, `resources`, `frontend/public`, `frontend/static`, `frontend/app`, `web/public`, `docs`, `.github`) times 7 names (`favicon.svg`, `favicon.png`, `favicon.ico`, `logo.svg`, `logo.png`, `icon.png`, `app-icon.png`), so it stats at most 91 paths and never walks the tree. Each file is read only if it is 96 KB or smaller, and its type is sniffed from the bytes (SVG, PNG, JPEG, GIF, WEBP, ICO), never the extension; anything else, including an HTML 404 page saved as `favicon.ico`, is skipped and the next candidate is tried. When a local image is found it is returned as a `data:` URL; nothing is written. **Remote fallback, the only network calls this plugin makes besides `api.github.com`:** `https://<host>/favicon.ico` then `https://<host>/favicon.png`, where `<host>` comes from a homepage the project declares in `composer.json`, `package.json`, `pyproject.toml` (`[project.urls] Homepage` or `Documentation`) or `Cargo.toml` (`[package] homepage`); then `https://github.com/<owner>.png?size=64` for the `origin` remote's owner, which also works for private repositories. Those requests are https only, carry a user agent naming this plugin and version and nothing else (no cookies, no auth header, no environment proxy), follow at most 2 redirects with the check repeated on each hop, time out after 2 s, and stop reading at 256 KB. The URL comes from repository content, so it is treated as hostile: the host is resolved with `getaddrinfo` before connecting and refused unless every address is globally routable, which blocks `localhost`, `127.0.0.0/8`, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `::1`, CGNAT and ULA addresses. **Kill file:** `<hermes home>/plugin-data/project-command-center/icons_remote.off`; while it exists (or when the plugin data directory cannot be resolved) no remote request is made and the route answers from local disk or the stack glyph. It is checked on every call, so it takes effect without a restart. Results are cached in memory: a local image for 300 s keyed by folder, file path and mtime, a remote image for 3600 s, a glyph for 300 s, and `refresh=1` bypasses all three.
+- No file contents are returned. No git write, no file upload, and no write beyond the four routes above: no issue, PR, label, assignee, ref or repository is created, edited or deleted.
 - Local writes, new in 0.3.0: `GET /board` reads and `POST /board/status`, `POST /board/link`, `POST /board/projects` and `POST /board/seed` write statuses (lane, note, who set it, when), session links (project, repo, issue, PR, title) and project ids (label, absolute paths) to `<hermes home>/plugin-data/project-command-center/board.db`, a SQLite file owned by the active profile. Nothing leaves the machine, and no credential is read or stored there.
 - The three agent tools (`pcc_board`, `pcc_set_status`, `pcc_work_item`) read the same file and write `status` and `link` rows with `source: "agent"`. They make no network call and run no shell command.
 - The two agent hooks (`pre_llm_call`, `post_tool_call`) read the same database inside the agent process, and `post_tool_call` also reads `tool_name`, `args.command` and `result` of `terminal` calls in memory (the text it was given, not a re-run). It writes the PR number and URL on a session's `link` row, and moves that project's `status` row to `review` with `source: "auto"` only from `backlog` or `active`. It checks `<hermes home>/plugin-data/project-command-center/auto_link.off` on every call and writes nothing while that file exists. No network call, no shell command, nothing written outside `board.db`.
@@ -151,6 +170,6 @@ The section degrades in three steps: a payload `{error}` (no remote, no auth, ra
 
 1. Shell: titlebar button, `/project-command-center` page, project kanban, sessions strip. Desktop only, state in `ctx.storage`.
 2. Project detail page (`/project-command-center/project`): stats strip and sessions grouped by lane, from `projects.project_sessions`.
-3. Backend: git status and branches, GitHub issues and PRs with issue links, plus the `On GitHub` section on the detail page. Shipped read only; writing back to GitHub comes later.
+3. Backend: git status and branches, GitHub issues and PRs with issue links, plus the `On GitHub` section on the detail page. The detail reads (comments, reviews, checks, batched `#number` refs) and the four write routes shipped after the first read only pass.
 4. Agent layer: the server side board store and its `/board` routes, the three tools (`pcc_board`, `pcc_set_status`, `pcc_work_item`) and the two hooks (`pre_llm_call` card context, `post_tool_call` PR auto-link with a kill file). The store and tools shipped in 0.3.0; the running indicator and open-session-from-issue follow.
 5. Polish and catalog packaging.
