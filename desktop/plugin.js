@@ -2594,7 +2594,7 @@ function GhMiniAvatar({ login }) {
   return jsx(Blobatar, { name, size: 16, title: name })
 }
 
-function GhComment({ comment, decorate }) {
+function GhComment({ comment, decorate, refKey }) {
   const at = ghAgo(comment.created_at)
 
   return jsxs('div', {
@@ -2609,13 +2609,17 @@ function GhComment({ comment, decorate }) {
         ]
       }),
       comment.body
-        ? jsx('div', { style: S.ghProse, children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(comment.body) }) })
+        ? jsx('div', {
+            key: `prose-${refKey || 'none'}`,
+            style: S.ghProse,
+            children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(comment.body) })
+          })
         : jsx('div', { style: S.ghQuiet, children: 'No comment text.' })
     ]
   })
 }
 
-function GhReviewEntry({ review, decorate }) {
+function GhReviewEntry({ decorate, refKey, review }) {
   const view = ghReviewView(review.state)
   const at = ghAgo(review.submitted_at)
 
@@ -2632,7 +2636,11 @@ function GhReviewEntry({ review, decorate }) {
         ]
       }),
       review.body
-        ? jsx('div', { style: S.ghProse, children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(review.body) }) })
+        ? jsx('div', {
+            key: `prose-${refKey || 'none'}`,
+            style: S.ghProse,
+            children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(review.body) })
+          })
         : null
     ]
   })
@@ -2735,6 +2743,10 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
   const refsData = refQuery.data
   const refs = useMemo(() => (refsData && refsData.ok && refsData.refs ? refsData.refs : {}), [refsData])
   const decorate = useCallback(children => ghDecorateRefs(children, refs, onOpen, folder), [refs, onOpen, folder])
+  // The markdown surface renders decorateText at parse time, so a body that
+  // painted before the refs landed never re-parses on its own. Keying each prose
+  // block on the resolved set forces exactly one remount when the answer arrives.
+  const refKey = useMemo(() => Object.keys(refs).sort().join(','), [refs])
 
   const [draft, setDraft] = useState('')
   const [note, setNote] = useState('')
@@ -2803,6 +2815,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
           head('book', 'Description'),
           detail.body
             ? jsx('div', {
+                key: `prose-${refKey || 'none'}`,
                 style: S.ghProse,
                 children: jsx(MessageTextContent, { decorateText: decorate, media: true, text: String(detail.body) })
               })
@@ -2815,7 +2828,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
             children: [
               head('comment-discussion', 'Reviews', reviews.length),
               ...reviews.map((review, i) =>
-                jsx(GhReviewEntry, { decorate, review }, `${review.author || 'x'}-${review.submitted_at || i}`)
+                jsx(GhReviewEntry, { decorate, refKey, review }, `${review.author || 'x'}-${review.submitted_at || i}`)
               )
             ]
           })
@@ -2826,7 +2839,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
           head('comment', 'Comments', comments.length),
           comments.length > 0
             ? comments.map((comment, i) =>
-                jsx(GhComment, { comment, decorate }, `${comment.id || comment.author || 'c'}-${comment.created_at || i}`)
+                jsx(GhComment, { comment, decorate, refKey }, `${comment.id || comment.author || 'c'}-${comment.created_at || i}`)
               )
             : jsx('div', { style: S.ghQuiet, children: 'No comments yet.' })
         ]

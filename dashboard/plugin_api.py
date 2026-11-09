@@ -2270,6 +2270,25 @@ async def github_refs(path: str = Query(..., description="Absolute path to the p
     return payload
 
 
+def _count_totals(data: Optional[dict[str, Any]], repos: Sequence[tuple[str, str]]
+                  ) -> dict[tuple[str, str], dict[str, Any]]:
+    """``{alias index}`` rows to ``{(owner, repo): counts}``; a null alias is dropped."""
+    totals: dict[tuple[str, str], dict[str, Any]] = {}
+    for index, (repo_owner, repo_name) in enumerate(repos):
+        node = (data or {}).get(f"r{index}")
+        if not isinstance(node, dict):
+            continue  # unreadable or gone: omitted, so no zero is read as a fact
+        issues_raw, pulls_raw = node.get("issues"), node.get("pullRequests")
+        issues: dict[str, Any] = issues_raw if isinstance(issues_raw, dict) else {}
+        pulls: dict[str, Any] = pulls_raw if isinstance(pulls_raw, dict) else {}
+        totals[(repo_owner.lower(), repo_name.lower())] = {
+            "owner": repo_owner, "repo": repo_name,
+            "issues_open": _int(issues.get("totalCount")),
+            "prs_open": _int(pulls.get("totalCount")),
+        }
+    return totals
+
+
 @router.get("/github/counts")
 async def github_counts(path: list[str] = Query(
                             default=[], description="Absolute path to a project folder; repeat the parameter"),
@@ -2339,19 +2358,22 @@ async def github_counts(path: list[str] = Query(
                 "error": _github_sentence(exc, owner, name, account),
                 "detail": exc.detail, "counts": {}}
 
-    totals: dict[tuple[str, str], dict[str, Any]] = {}
-    for index, (repo_owner, repo_name) in enumerate(wanted):
-        node = (data or {}).get(f"r{index}")
-        if not isinstance(node, dict):
-            continue  # unreadable or gone: omitted, so no zero is read as a fact
-        issues_raw, pulls_raw = node.get("issues"), node.get("pullRequests")
-        issues: dict[str, Any] = issues_raw if isinstance(issues_raw, dict) else {}
-        pulls: dict[str, Any] = pulls_raw if isinstance(pulls_raw, dict) else {}
-        totals[(repo_owner.lower(), repo_name.lower())] = {
-            "owner": repo_owner, "repo": repo_name,
-            "issues_open": _int(issues.get("totalCount")),
-            "prs_open": _int(pulls.get("totalCount")),
-        }
+    totals = _count_totals(data, wanted)
+
+    # A token blind to one private org repository answers a null alias beside a
+    # NOT_FOUND, which ``partial`` accepts as "gone". In a mixed batch that is
+    # indistinguishable from a repository that does not exist, so retry ONLY the
+    # aliases that came back null through the user's own gh login.
+    missing = [repo for index, repo in enumerate(wanted)
+               if not isinstance((data or {}).get(f"r{index}"), dict)]
+    if missing and mode == "token" and shutil.which("gh") is not None:
+        retry_query, retry_vars = _counts_query(missing)
+        try:
+            retry_data = await _GitHub(missing[0][0], missing[0][1], "gh", None).graphql(
+                retry_query, retry_vars, partial=True)
+            totals.update(_count_totals(retry_data, missing))
+        except _UpstreamError as exc:
+            log.warning("project-command-center: counts gh retry failed: %s", exc)
 
     counts = {text: totals[(path_owner.lower(), path_name.lower())]
               for text, path_owner, path_name in folders
