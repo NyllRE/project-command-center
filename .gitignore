@@ -1,0 +1,3 @@
+# Python half: bytecode from importing the plugin (validate, the gateway)
+__pycache__/
+*.py[cod]

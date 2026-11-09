@@ -1,0 +1,20 @@
+name: project-command-center
+version: 0.3.0
+description: "Project command center for Hermes Desktop. Every project's sessions and totals on one board, plus a detail page per project with a stats strip, sessions grouped by lane, live turn state, local git status, and GitHub issues and PRs with the issue links GitHub itself knows about. The board's statuses, session-to-project links and project ids live in a local SQLite store that both halves share, and three agent tools read the board and move a project's lane or attach the issue or PR a session is working on."
+author: NyllRE
+license: MIT
+requires_hermes: ">=0.23.0"
+entry:
+  desktop: desktop/plugin.js
+provides_tools:
+  - pcc_board
+  - pcc_set_status
+  - pcc_work_item
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
+optional_env:
+  - name: GITHUB_TOKEN
+    description: "Optional GitHub token for the board's GitHub reads. With no token the backend uses your authenticated gh CLI, and public repositories still read fine unauthenticated."
+    url: "https://github.com/settings/tokens?type=beta"
+    secret: true
