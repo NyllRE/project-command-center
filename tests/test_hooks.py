@@ -23,7 +23,9 @@ import importlib.util
 import json
 import os
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -371,18 +373,28 @@ def main() -> int:
     section("post_tool_call / a link row that names no repo")
     # An empty repo used to be refused unless the project came from the session's
     # own cwd. It is now checked against the project folder's own origin remote,
-    # which is the shape a Desktop created link actually has.
+    # which is the shape a Desktop created link actually has. The folder is made
+    # here so the case does not depend on how this checkout was cloned.
     mine = "NyllRE/project-command-center"
     mine_url = f"https://github.com/{mine}/pull/42"
+    git_home = Path(tempfile.mkdtemp(prefix="pcc-hook-remote-"))
+    subprocess.run(["git", "init", "-q", str(git_home)], check=True)
+    subprocess.run(["git", "-C", str(git_home), "remote", "add", "origin",
+                    f"https://github.com/{mine}.git"], check=True)
+    subprocess.run(["git", "-C", str(git_home), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(git_home), "config", "user.name", "Test"], check=True)
+    store.set_projects([{"id": "pcc-remote", "label": "Remote", "paths": [str(git_home)]}])
+    store.set_status("pcc-remote", "active", "in flight", "user")
     for session, by in (("s-cwd", "cwd"), ("s-agent", "agent"), ("s-desktop", "desktop")):
-        store.set_link(session, "pcc", repo="", issue=7, title=title, resolved_by=by)
+        store.set_link(session, "pcc-remote", repo="", issue=7, title=title, resolved_by=by)
     for session in ("s-cwd", "s-agent", "s-desktop"):
         reset(session)
         hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},
                              result=f"{mine_url}\n", session_id=session)
         print(f"  {session:<11} pr={link(session).get('pr')} repo={link(session).get('repo')} lane={lane()}")
     check("empty repo + URL names the project remote writes",
-          link("s-cwd").get("pr") == 42 and lane() == "review")
+          link("s-cwd").get("pr") == 42
+          and (store.get_status("pcc-remote") or {}).get("status") == "review")
     check("empty repo + resolved_by=agent writes too, it was the real case", link("s-agent").get("pr") == 42)
     check("empty repo + resolved_by=desktop writes too", link("s-desktop").get("pr") == 42)
     check("the resolved repo is stored on the row", link("s-agent").get("repo") == mine)
