@@ -34,15 +34,10 @@ That restart also kills any shell running inside the same unit, which is why it 
 ## Tests
 
 ```bash
-node --test tests/graph_layout.test.mjs tests/github_status.test.mjs tests/session_lane.test.mjs
-python3 tests/test_hooks.py
-python3 tests/test_session_status.py
-python3 tests/test_git_routes.py
-python3 tests/test_branch_switch.py
-python3 tests/test_icons.py
-python3 tests/test_avatars.py
-python3 tests/test_github_states.py
+make test
 ```
+
+That is the whole story. It finds the Hermes venv python, runs every suite, and each suite finds the Hermes tree and a throwaway `HERMES_HOME` by itself, so a fresh clone works with no `PYTHONPATH` and no environment setup. Override the interpreter with `make test PYTHON=/path/to/python`.
 
 | Suite | Covers |
 |---|---|

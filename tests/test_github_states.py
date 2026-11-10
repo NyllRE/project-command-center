@@ -16,6 +16,12 @@ repeat read without touching the reader.
 
 from __future__ import annotations
 
+import sys as _sys
+
+_sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+
+import _bootstrap  # noqa: E402,F401  finds the Hermes tree and a sandbox home
+
 import asyncio
 import importlib.util
 import os

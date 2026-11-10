@@ -1,3 +1,6 @@
 # Python half: bytecode from importing the plugin (validate, the gateway)
 __pycache__/
 *.py[cod]
+
+# Test runs keep their throwaway Hermes home here
+tests/.tmp/
