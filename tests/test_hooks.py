@@ -363,30 +363,38 @@ def main() -> int:
     check("a real command after && still writes", link("s-compound").get("pr") == 42)
 
     section("post_tool_call / a link row that names no repo")
-    for session, by in (("s-cwd", "cwd"), ("s-cwd-other", "cwd"),
-                        ("s-agent", "agent"), ("s-desktop", "desktop")):
+    # An empty repo used to be refused unless the project came from the session's
+    # own cwd. It is now checked against the project folder's own origin remote,
+    # which is the shape a Desktop created link actually has.
+    mine = "NyllRE/project-command-center"
+    mine_url = f"https://github.com/{mine}/pull/42"
+    for session, by in (("s-cwd", "cwd"), ("s-agent", "agent"), ("s-desktop", "desktop")):
         store.set_link(session, "pcc", repo="", issue=7, title=title, resolved_by=by)
-    reset("s-cwd")
-    hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},
-                         result=f"{url}\n", session_id="s-cwd")
-    print(f"  resolved_by=cwd pr={link('s-cwd').get('pr')} lane={lane()} events={len(events)}")
-    check("empty repo + resolved_by=cwd writes", link("s-cwd").get("pr") == 42 and lane() == "review")
-
-    other = "https://github.com/other/thing/pull/51"
-    reset("s-cwd-other")
-    hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},
-                         result=f"{other}\n", session_id="s-cwd-other")
-    print(f"  cwd, other repo pr={link('s-cwd-other').get('pr')} lane={lane()} events={len(events)}")
-    check("empty repo + resolved_by=cwd may claim another repo",
-          link("s-cwd-other").get("pr") == 51)
-
-    for session in ("s-agent", "s-desktop"):
+    for session in ("s-cwd", "s-agent", "s-desktop"):
         reset(session)
         hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},
-                             result=f"{url}\n", session_id=session)
-        print(f"  {session:<15} pr={link(session).get('pr')} lane={lane()} events={len(events)}")
-    check("empty repo + resolved_by=agent does not write", untouched("s-agent", "active"))
-    check("empty repo + resolved_by=desktop does not write", untouched("s-desktop", "active"))
+                             result=f"{mine_url}\n", session_id=session)
+        print(f"  {session:<11} pr={link(session).get('pr')} repo={link(session).get('repo')} lane={lane()}")
+    check("empty repo + URL names the project remote writes",
+          link("s-cwd").get("pr") == 42 and lane() == "review")
+    check("empty repo + resolved_by=agent writes too, it was the real case", link("s-agent").get("pr") == 42)
+    check("empty repo + resolved_by=desktop writes too", link("s-desktop").get("pr") == 42)
+    check("the resolved repo is stored on the row", link("s-agent").get("repo") == mine)
+
+    store.set_link("s-other-repo", "pcc", repo="", issue=7, title=title, resolved_by="agent")
+    reset("s-other-repo")
+    hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},
+                         result="https://github.com/other/thing/pull/51\n", session_id="s-other-repo")
+    print(f"  other repo     pr={link('s-other-repo').get('pr')} lane={lane()}")
+    check("empty repo + a URL from another repo does not write", untouched("s-other-repo", "active"))
+
+    store.set_projects([{"id": "pcc-nofolder", "label": "No folder", "paths": ["/nonexistent/pcc"]}])
+    store.set_link("s-nofolder", "pcc-nofolder", repo="", issue=7, title=title, resolved_by="agent")
+    hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},
+                         result=f"{mine_url}\n", session_id="s-nofolder")
+    print(f"  no folder      pr={(store.get_link('s-nofolder') or {}).get('pr')}")
+    check("empty repo + an unreadable project folder does not write",
+          not (store.get_link("s-nofolder") or {}).get("pr"))
 
     section("session lineage / runtime id newer than the stored row")
     from hermes_state import SessionDB

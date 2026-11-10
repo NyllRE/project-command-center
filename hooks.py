@@ -1,8 +1,9 @@
 """Agent hooks for Project Command Center: card context in, PR link out.
 
-Two hooks, both synchronous and local. Neither opens a socket, starts a process or reads a
-credential: the only files either one touches are the SQLite board and (on a link-row miss) the
-session database, both through ``board_store.py``.
+Two hooks, both synchronous and local. Neither opens a socket or reads a credential: the only files
+either one touches are the SQLite board and (on a link-row miss) the session database, both through
+``board_store.py``. ``post_tool_call`` may run one fixed argv ``git config`` read to check a PR URL
+against the project folder's own origin remote, and nothing else.
 
   * ``pre_llm_call``   read only. The card this session works in, one line per part, at most 400
     characters, injected into the turn's user message. The lane named is the session's own when it
@@ -29,7 +30,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -241,8 +244,41 @@ def _tool_failed(payload: dict[str, Any], text: str) -> bool:
     return any(needle in lowered for needle in _FAILURE_TEXT)
 
 
+_REMOTE_RE = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE)
+
+
+def _project_remote(store: Any, project_id: str) -> str:
+    """``owner/repo`` from the project's own folder, or ``""`` when it cannot be read.
+
+    A link row created from the Desktop usually names no repo, so the PR URL's
+    repository is checked against the folder the project actually pushes to. One
+    fixed argv ``git config`` read, no shell, and every failure is a quiet miss
+    because a hook must never cost a turn.
+    """
+    try:
+        project = store.get_project(project_id) or {}
+    except Exception:
+        return ""
+    paths = project.get("paths") or []
+    if isinstance(paths, str):
+        paths = [paths]
+    for raw in paths:
+        path = str(raw or "").strip()
+        if not path or not os.path.isdir(path):
+            continue
+        try:
+            done = subprocess.run(
+                ["git", "-C", path, "config", "--get", "remote.origin.url"],
+                capture_output=True, text=True, timeout=3.0)
+        except Exception:
+            continue
+        match = _REMOTE_RE.search((done.stdout or "").strip())
+        if match:
+            return f"{match.group(1)}/{match.group(2)}"
+    return ""
+
+
 def _auto_link(payload: dict[str, Any]) -> bool:
-    """The write, gated in this order: tool, command, result, kill file, session, project, repo."""
     if payload.get("tool_name") != "terminal":
         return False
     args = payload.get("args")
@@ -274,10 +310,13 @@ def _auto_link(payload: dict[str, Any]) -> bool:
     if repo:
         if repo.lower() != wanted.lower():
             return False
-    elif str(row.get("resolved_by") or "") != "cwd":
-        # An empty repo is only trustworthy when the project came from the session's own folder.
-        # A Desktop-attached or explicitly named project must match the URL's repo.
-        return False
+    else:
+        # A Desktop-attached link rarely names a repo, so resolve it from the
+        # project's own folder instead of refusing: the PR URL is only trusted
+        # when it names the repository that folder actually pushes to.
+        repo = _project_remote(store, project_id)
+        if not repo or repo.lower() != wanted.lower():
+            return False
     pr = int(match.group(3))
     if not store.set_link(key, project_id, repo=repo or None, pr=pr,
                           pr_url=match.group(0)).get("ok"):
