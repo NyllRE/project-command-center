@@ -6,6 +6,8 @@ Click an issue and a session opens in that repo with the issue already sitting i
 
 ![Project Command Center](./docs/covers/cover-final.png)
 
+**[Watch the demo on X](https://x.com/NyllRe/status/2120286833397354861)**
+
 ```bash
 hermes plugins install NyllRE/project-command-center --enable
 ```
