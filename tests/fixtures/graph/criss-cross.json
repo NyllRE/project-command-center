@@ -1,0 +1,95 @@
+{
+  "description": "Two merges with opposite parent order. First-parent preference keeps trunk at lane 0 and the duplicate wait converges.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "x",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "x"
+      },
+      {
+        "name": "refs/heads/feature",
+        "short": "feature",
+        "kind": "local",
+        "sha": "y"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "x",
+        "parents": [
+          "a",
+          "b"
+        ],
+        "subject": "x"
+      },
+      {
+        "sha": "y",
+        "parents": [
+          "b",
+          "a"
+        ],
+        "subject": "y"
+      },
+      {
+        "sha": "a",
+        "parents": [
+          "c"
+        ],
+        "subject": "a"
+      },
+      {
+        "sha": "b",
+        "parents": [
+          "c"
+        ],
+        "subject": "b"
+      },
+      {
+        "sha": "c",
+        "parents": [],
+        "subject": "c"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 3,
+    "maxLanes": 3,
+    "lanes": {
+      "x": 0,
+      "y": 2,
+      "a": 0,
+      "b": 2,
+      "c": 0
+    },
+    "joins": {
+      "y": [
+        0
+      ]
+    },
+    "converging": {
+      "b": [
+        1
+      ],
+      "c": [
+        2
+      ]
+    },
+    "bandEdges": [
+      2,
+      4,
+      3,
+      2,
+      0
+    ]
+  },
+  "name": "criss-cross"
+}

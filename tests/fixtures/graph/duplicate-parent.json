@@ -1,0 +1,69 @@
+{
+  "description": "A duplicate parent is deduped and is not an anomaly: two parents in, two parents out.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "m",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "m"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "m",
+        "parents": [
+          "a",
+          "a",
+          "b"
+        ],
+        "subject": "m"
+      },
+      {
+        "sha": "a",
+        "parents": [
+          "c"
+        ],
+        "subject": "a"
+      },
+      {
+        "sha": "b",
+        "parents": [
+          "c"
+        ],
+        "subject": "b"
+      },
+      {
+        "sha": "c",
+        "parents": [],
+        "subject": "c"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 3,
+    "maxLanes": 2,
+    "lanes": {
+      "m": 0,
+      "a": 0,
+      "b": 1,
+      "c": 0
+    },
+    "outDegree": {
+      "m": 2
+    },
+    "converging": {
+      "c": [
+        1
+      ]
+    }
+  },
+  "name": "duplicate-parent"
+}

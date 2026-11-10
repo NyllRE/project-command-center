@@ -1,0 +1,91 @@
+{
+  "description": "A feature tip is newer than main. Trunk still pins main's chain to lane 0.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "m2",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "m2"
+      },
+      {
+        "name": "refs/remotes/origin/main",
+        "short": "origin/main",
+        "kind": "remote",
+        "sha": "m2"
+      },
+      {
+        "name": "refs/heads/feature",
+        "short": "feature",
+        "kind": "local",
+        "sha": "f2"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "f2",
+        "parents": [
+          "f1"
+        ],
+        "subject": "f2"
+      },
+      {
+        "sha": "f1",
+        "parents": [
+          "m1"
+        ],
+        "subject": "f1"
+      },
+      {
+        "sha": "m2",
+        "parents": [
+          "m1"
+        ],
+        "subject": "m2"
+      },
+      {
+        "sha": "m1",
+        "parents": [
+          "base"
+        ],
+        "subject": "m1"
+      },
+      {
+        "sha": "base",
+        "parents": [],
+        "subject": "base"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 3,
+    "maxLanes": 2,
+    "lanes": {
+      "f2": 1,
+      "f1": 1,
+      "m2": 0,
+      "m1": 0,
+      "base": 0
+    },
+    "converging": {
+      "m1": [
+        1
+      ]
+    },
+    "bandEdges": [
+      1,
+      1,
+      2,
+      1,
+      0
+    ]
+  },
+  "name": "trunk-pinning"
+}

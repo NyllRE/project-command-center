@@ -1,0 +1,69 @@
+{
+  "description": "Local main is behind origin/main; the remote tip starts the trunk and one line covers both. The default branch comes from origin/HEAD's symref.",
+  "input": {
+    "default_branch": null,
+    "head": {
+      "sha": "m1",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "m1"
+      },
+      {
+        "name": "refs/remotes/origin/main",
+        "short": "origin/main",
+        "kind": "remote",
+        "sha": "m2"
+      },
+      {
+        "name": "refs/remotes/origin/HEAD",
+        "short": "origin/HEAD",
+        "kind": "remote",
+        "sha": "m2",
+        "symref": "refs/remotes/origin/main"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "m2",
+        "parents": [
+          "m1"
+        ],
+        "subject": "m2"
+      },
+      {
+        "sha": "m1",
+        "parents": [
+          "base"
+        ],
+        "subject": "m1"
+      },
+      {
+        "sha": "base",
+        "parents": [],
+        "subject": "base"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 3,
+    "maxLanes": 1,
+    "lanes": {
+      "m2": 0,
+      "m1": 0,
+      "base": 0
+    },
+    "bandEdges": [
+      1,
+      1,
+      0
+    ]
+  },
+  "name": "trunk-remote-ahead"
+}

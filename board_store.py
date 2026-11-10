@@ -6,10 +6,17 @@ module is the single writer of that state:
 
   * ``status``  one row per project: backlog / active / review / blocked / done, a note, who wrote
     it (``user``, ``agent``, ``auto``) and when.
-  * ``link``    one row per session: the project it works in, plus the issue or PR the session is
-    attached to. The Desktop reads it for the running indicator; the tools write it.
+  * ``link``    one row per session: the project it works in, the issue or PR the session is
+    attached to, and the session's own lane (``status``, ``note``, ``status_source`` and
+    ``status_updated_at``). The Desktop reads it for the running indicator; the tools write it.
   * ``project`` the ids, labels and absolute paths the board knows about, upserted by the Desktop
     half (``POST /board/projects``) so path based resolution has something to match.
+
+A session's card is its own: the ``link`` lane columns hold what the session is doing right now,
+while the ``status`` row keeps the project's lane. :func:`resolve_lane` is the single rule this
+module and the Desktop renderer apply: an explicit session lane wins, otherwise the project lane is
+what the card shows. The server never derives a lane from PR state; the renderer refines PR states
+from the rows it already has.
 
 Storage is ``plugins.plugin_storage.plugin_db`` (public, see ``website/docs/developer-guide/plugins/
 public-api.md``): ``<hermes home>/plugin-data/project-command-center/board.db``, WAL, profile scoped,
@@ -48,6 +55,9 @@ DB_FILENAME = "board.db"
 
 STATUSES = ("backlog", "active", "review", "blocked", "done")
 SOURCES = ("user", "agent", "auto")
+# Which card a status write lands on: the session's own lane, the project's, or auto (session when
+# a session id is given, project otherwise).
+STATUS_SCOPES = ("auto", "session", "project")
 KINDS = ("issue", "pr")
 # How a link row's project was decided: the session's own folder, the Desktop, or an agent tool.
 # Only ``cwd`` may auto-link a PR from a repository the row does not name.
@@ -74,7 +84,11 @@ CREATE TABLE IF NOT EXISTS link (
     title TEXT,
     resolved_by TEXT,
     created_at REAL,
-    updated_at REAL
+    updated_at REAL,
+    status TEXT CHECK (status IN ('backlog', 'active', 'review', 'blocked', 'done')),
+    note TEXT,
+    status_source TEXT CHECK (status_source IN ('user', 'agent', 'auto')),
+    status_updated_at REAL
 )
 """,
     """
@@ -90,12 +104,18 @@ CREATE TABLE IF NOT EXISTS project (
 )
 
 # Columns added after a database was first created. ``_ensure_schema`` applies them once per file.
+# A session's lane lives on its link row, so an existing board.db gains the lane columns in place
+# on the first read after an upgrade; the project lane in ``status`` is untouched.
 _MIGRATIONS = (
     ("link", "resolved_by", "TEXT"),
+    ("link", "status", "TEXT CHECK (status IN ('backlog', 'active', 'review', 'blocked', 'done'))"),
+    ("link", "note", "TEXT"),
+    ("link", "status_source", "TEXT CHECK (status_source IN ('user', 'agent', 'auto'))"),
+    ("link", "status_updated_at", "REAL"),
 )
 
 _LINK_COLUMNS = ("session_id, project_id, repo, issue, pr, pr_url, title, resolved_by, "
-                 "created_at, updated_at")
+                 "created_at, updated_at, status, note, status_source, status_updated_at")
 
 # The schema is created once per process per database path. This is import bookkeeping, not board
 # state: no row is ever held here, every read goes to the file.
@@ -220,10 +240,39 @@ def _status_row(row: Sequence[Any]) -> dict[str, Any]:
 
 def _link_row(row: Sequence[Any]) -> dict[str, Any]:
     (session_id, project_id, repo, issue, pr, pr_url, title, resolved_by,
-     created_at, updated_at) = row
+     created_at, updated_at, status, note, status_source, status_updated_at) = row
     return {"session_id": session_id, "project_id": project_id or "", "repo": repo or "",
             "issue": issue, "pr": pr, "pr_url": pr_url, "title": title or "",
-            "resolved_by": resolved_by or "", "created_at": created_at, "updated_at": updated_at}
+            "resolved_by": resolved_by or "", "created_at": created_at, "updated_at": updated_at,
+            "status": _clean(status).lower() or None, "note": note or "",
+            "status_source": _clean(status_source).lower() or None,
+            "status_updated_at": status_updated_at}
+
+
+def resolve_lane(link: Optional[dict[str, Any]],
+                 status: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """The lane a card shows: an explicit session status wins, otherwise the project's lane.
+
+    This is the one rule the server and the Desktop renderer share. The renderer cannot import
+    Python, so it applies the same order to the rows ``GET /board`` hands it: ``link.status`` when
+    it is set, else the ``status`` row for the link's project. No PR state is consulted here; the
+    renderer refines a PR's own state from data it already has.
+    """
+    link = link or {}
+    status = status or {}
+    lane = _clean(link.get("status")).lower()
+    if lane in STATUSES:
+        return {"status": lane, "scope": "session",
+                "source": _clean(link.get("status_source")).lower() or "user",
+                "note": link.get("note") or "",
+                "updated_at": link.get("status_updated_at")}
+    lane = _clean(status.get("status")).lower()
+    if lane in STATUSES:
+        return {"status": lane, "scope": "project",
+                "source": _clean(status.get("source")).lower() or "user",
+                "note": status.get("note") or "",
+                "updated_at": status.get("updated_at")}
+    return {"status": "", "scope": "", "source": "", "note": "", "updated_at": None}
 
 
 def _paths(value: Any) -> list[str]:
@@ -372,6 +421,18 @@ def _link_on(conn: sqlite3.Connection, session_id: str) -> Optional[Sequence[Any
         f"SELECT {_LINK_COLUMNS} FROM link WHERE session_id = ?", (session_id,)).fetchone()
 
 
+def _link_now(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
+    """The link row a write in this transaction just touched, as a dict.
+
+    A missing row here means the primary key vanished under the write lock, so the transaction is
+    rolled back and the caller answers ``store_error`` instead of pretending it read a card.
+    """
+    row = _link_on(conn, session_id)
+    if row is None:
+        raise sqlite3.DatabaseError(f"link row for {session_id!r} disappeared during a write")
+    return _link_row(row)
+
+
 def _resolve_link_on(conn: sqlite3.Connection, session_id: str) -> tuple[str, Optional[Sequence[Any]]]:
     """``(key, row)`` for a runtime session id: itself when it owns a row, else its lineage ancestor.
 
@@ -424,8 +485,9 @@ def session_card(session_id: Optional[str]) -> dict[str, Any]:
             project_row = conn.execute(
                 "SELECT project_id, label, paths, updated_at FROM project WHERE project_id = ?",
                 (pid,)).fetchone()
-    return _ok(session_id=key, link=link,
-               status=_status_row(status_row) if status_row else None,
+    state = _status_row(status_row) if status_row else None
+    return _ok(session_id=key, link=link, status=state,
+               lane=resolve_lane(link, state),
                project=_project_row(project_row) if project_row else None)
 
 
@@ -445,8 +507,9 @@ def card_for_project(project_id: Optional[str], session_id: Optional[str] = None
         project_row = conn.execute(
             "SELECT project_id, label, paths, updated_at FROM project WHERE project_id = ?",
             (pid,)).fetchone()
-    return _ok(session_id=session_id or "", link=None,
-               status=_status_row(status_row) if status_row else None,
+    state = _status_row(status_row) if status_row else None
+    return _ok(session_id=session_id or "", link=None, status=state,
+               lane=resolve_lane(None, state),
                project=_project_row(project_row) if project_row else None)
 
 
@@ -468,24 +531,40 @@ def project_exists(project_id: Optional[str]) -> bool:
 
 
 def set_status(project_id: Optional[str], status: Optional[str], note: Optional[str] = None,
-               source: str = "user", *, auto_project: bool = False) -> dict[str, Any]:
-    """Write one project's status. A note passed here replaces the row's note; omitting it (or
-    passing an empty string) keeps whatever note is already on the card.
+               source: str = "user", *, auto_project: bool = False,
+               session_id: Optional[str] = None, scope: str = "auto") -> dict[str, Any]:
+    """Write one card's lane. A note passed here replaces the card's note; omitting it (or passing
+    an empty string) keeps whatever note is already there.
+
+    ``session_id`` moves that session's own card (its ``link`` row) instead of the project's.
+    ``scope`` decides which: ``auto`` (the default) takes the session card when a session id is
+    given, ``session`` insists on one, and ``project`` keeps the project lane even when a session id
+    is present. A session id with no link row gets one created, so a lane write is never dropped;
+    ``project_id`` is required then, and an id the board has never synced is ``unknown_project``
+    unless ``auto_project`` applies.
 
     ``auto_project`` lets the agent paths create a bare project row, but only on a board whose
-    project table is still empty — a fresh install where the Desktop has not synced yet. Once the
+    project table is still empty, a fresh install where the Desktop has not synced yet. Once the
     Desktop has synced anything, an id the table does not know is a typo, and both the tools and
     the routes answer ``unknown_project`` instead of growing a ghost project.
     """
     pid = _clean(project_id)
-    if not pid:
-        return _fail("empty_project", "project_id is required")
     state = _clean(status).lower()
     if state not in STATUSES:
         return _fail("bad_status", f"status must be one of {', '.join(STATUSES)}", status=status)
     src = _clean(source).lower() or "user"
     if src not in SOURCES:
         return _fail("bad_source", f"source must be one of {', '.join(SOURCES)}")
+    which = _clean(scope).lower() or "auto"
+    if which not in STATUS_SCOPES:
+        return _fail("bad_scope", f"scope must be one of {', '.join(STATUS_SCOPES)}")
+    sid = _clean(session_id)
+    if which == "session" and not sid:
+        return _fail("empty_session", "session_id is required when scope is session")
+    if which != "project" and sid:
+        return _set_session_status(pid, sid, state, note, src, auto_project=auto_project)
+    if not pid:
+        return _fail("empty_project", "project_id is required")
     now = time.time()
     with _session() as conn:
         with _write(conn):
@@ -502,7 +581,41 @@ def set_status(project_id: Optional[str], status: Optional[str], note: Optional[
             row = conn.execute(
                 "SELECT project_id, status, note, source, updated_at FROM status WHERE project_id = ?",
                 (pid,)).fetchone()
-            return _ok(status=_status_row(row))
+            return _ok(status=_status_row(row), scope="project")
+
+
+def _set_session_status(pid: str, sid: str, state: str, note: Optional[str], src: str, *,
+                        auto_project: bool = False) -> dict[str, Any]:
+    """Write one session's lane on its link row, creating the row when it has none."""
+    now = time.time()
+    with _session() as conn:
+        with _write(conn):
+            key, row = _resolve_link_on(conn, sid)
+            if row is None:
+                if not pid:
+                    return _fail("empty_project",
+                                 "project_id is required to create this session's card")
+                if not _project_exists(conn, pid):
+                    if not (auto_project and _project_table_empty(conn)):
+                        return _fail("unknown_project", f"{pid!r} is not a synced project",
+                                     project_id=pid)
+                    _ensure_project(conn, pid)
+                conn.execute(
+                    "INSERT INTO link (session_id, project_id, created_at, updated_at, status, "
+                    "note, status_source, status_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (sid, pid, now, now, state, _clean(note) or None, src, now))
+                return _ok(link=_link_now(conn, sid), scope="session", created=True)
+            on_row = _clean(_link_row(row).get("project_id"))
+            if pid and on_row and pid != on_row:
+                return _fail("project_mismatch",
+                             f"session {key!r} is already carded under {on_row!r}",
+                             project_id=on_row, session_id=key)
+            conn.execute(
+                "UPDATE link SET status = ?, note = COALESCE(?, note), status_source = ?, "
+                "status_updated_at = ?, updated_at = ?, "
+                "project_id = COALESCE(NULLIF(project_id, ''), ?) WHERE session_id = ?",
+                (state, _clean(note) or None, src, now, now, pid or None, key))
+            return _ok(link=_link_now(conn, key), scope="session")
 
 
 def move_status_if_current(project_id: Optional[str], expect: Optional[str], new: Optional[str],
@@ -541,6 +654,47 @@ def move_status_if_current(project_id: Optional[str], expect: Optional[str], new
                 "SELECT project_id, status, note, source, updated_at FROM status WHERE project_id = ?",
                 (pid,)).fetchone()
             return _ok(status=_status_row(fresh), changed=True)
+
+
+def move_session_status_if_current(session_id: Optional[str], expect: Any, new: Optional[str],
+                                   note: Optional[str] = None,
+                                   source: str = "auto") -> dict[str, Any]:
+    """Compare-and-set one session's lane inside one ``BEGIN IMMEDIATE`` transaction.
+
+    ``expect`` is the lane the caller last saw: one lane name, a tuple of acceptable lanes, or
+    ``None`` / ``""`` for "this session has no lane yet". Read and update share the write lock, so a
+    person moving the card between the caller's read and this write wins: the answer is
+    ``code: status_changed`` with the lane that won, and the caller leaves it alone.
+    """
+    sid = _clean(session_id)
+    if not sid:
+        return _fail("empty_session", "session_id is required")
+    state = _clean(new).lower()
+    if state not in STATUSES:
+        return _fail("bad_status", f"status must be one of {', '.join(STATUSES)}", status=new)
+    src = _clean(source).lower() or "auto"
+    if src not in SOURCES:
+        return _fail("bad_source", f"source must be one of {', '.join(SOURCES)}")
+    wanted = expect if isinstance(expect, (list, tuple, set)) else (expect,)
+    lanes = {(_clean(item).lower()) for item in wanted}
+    now = time.time()
+    with _session() as conn:
+        with _write(conn):
+            key, row = _resolve_link_on(conn, sid)
+            if row is None:
+                return _fail("no_link", "this session has no card row", session_id=sid)
+            current = _clean(_link_row(row).get("status")).lower()
+            if current not in lanes:
+                return _fail("status_changed",
+                             f"session {key!r} is {current or 'unset'}, not "
+                             f"{', '.join(sorted(lane or 'unset' for lane in lanes))}",
+                             session_id=key, current=current)
+            conn.execute(
+                "UPDATE link SET status = ?, note = COALESCE(?, note), status_source = ?, "
+                "status_updated_at = ?, updated_at = ? "
+                "WHERE session_id = ? AND IFNULL(status, '') = ?",
+                (state, _clean(note) or None, src, now, now, key, current))
+            return _ok(link=_link_now(conn, key), changed=True)
 
 
 def set_projects(items: Any) -> dict[str, Any]:

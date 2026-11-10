@@ -46,7 +46,6 @@ import {
   fmtDateTime,
   host,
   queryClient,
-  relativeTime,
   useMutation,
   useQuery,
   useValue,
@@ -77,7 +76,7 @@ const BOARD_SYNC_DEBOUNCE_MS = 900
 const BOARD_WRITE_GRACE_MS = 8000
 // The draft is a set of entry points, not a summary: where the issue lives and
 // one line of context, small enough that the agent reads the issue itself.
-// The composer only answers once the new chat has painted, so the draft is
+// The composer only answers once the new session has painted, so the draft is
 // written on this bounded retry schedule instead of once.
 const DRAFT_RETRY_MS = [120, 300, 600, 1000, 2000]
 
@@ -102,6 +101,138 @@ const SORTS = [
 const DEFAULT_SORT = 'recent'
 const STATUS_RANK = { backlog: 0, active: 1, review: 2, blocked: 3, done: 4 }
 const STATUS_BY_ID = Object.fromEntries(STATUSES.map(s => [s.id, s]))
+// How far the badge's PR refinement reaches. Matches the backend's MAX_REFS.
+const REF_BATCH_MAX = 50
+
+// session-lane:begin
+// One resolution order for every surface that shows a session's lane: an
+// explicit per-session status first, then the linked pull request, then the
+// project lane, then nothing. /board rows from a backend that predates the
+// per-session lane carry no status fields at all, and a missing field reads
+// exactly like an unset one here, so the older process still renders the PR
+// and project fallbacks instead of an error or a placeholder.
+const SESSION_LANE_LABELS = {
+  backlog: 'Backlog',
+  active: 'Active',
+  review: 'Review',
+  blocked: 'Blocked',
+  done: 'Done'
+}
+// Theme variables the plugin already paints with, so a badge follows the theme.
+const SESSION_LANE_VARS = {
+  backlog: 'var(--ui-text-quaternary)',
+  active: 'var(--ui-accent)',
+  review: 'var(--ui-purple)',
+  blocked: 'var(--ui-red)',
+  done: 'var(--ui-green)'
+}
+const SESSION_LANE_SOURCE_TEXT = {
+  user: 'set by you',
+  agent: 'set by the agent',
+  auto: 'set automatically',
+  pr: 'from its pull request',
+  project: 'from the project'
+}
+// Signal first: what a glance at the column should surface.
+const SESSION_LANE_TALLY_ORDER = ['blocked', 'review', 'done', 'active', 'backlog']
+
+function sessionLaneId(value) {
+  const id = typeof value === 'string' ? value.trim().toLowerCase() : ''
+
+  return Object.prototype.hasOwnProperty.call(SESSION_LANE_LABELS, id) ? id : ''
+}
+
+// A PR row from /github/refs or /github/pr/{n}. Merged is done, open or draft
+// is review, closed without a merge proves nothing and leaves the lane alone.
+function sessionPrLane(pr) {
+  if (!pr || typeof pr !== 'object') return ''
+  const state = String(pr.state || '').trim().toLowerCase()
+
+  if (pr.merged === true || state === 'merged') return 'done'
+  if (state === 'open' || pr.draft === true) return 'review'
+
+  return ''
+}
+
+function resolveSessionLane(link, pr, projectLane) {
+  const explicit = sessionLaneId(link && link.status)
+
+  if (explicit) {
+    const raw = String((link && link.status_source) || '').trim().toLowerCase()
+    const source = raw === 'agent' || raw === 'auto' ? raw : 'user'
+    const note = typeof link.note === 'string' ? link.note.trim() : ''
+
+    return { lane: explicit, note, source }
+  }
+
+  const refined = sessionPrLane(pr)
+
+  if (refined) return { lane: refined, note: '', source: 'pr' }
+
+  const project = sessionLaneId(projectLane)
+
+  if (project) return { lane: project, note: '', source: 'project' }
+
+  return null
+}
+
+function sessionLaneTitle(lane) {
+  if (!lane) return ''
+  const label = SESSION_LANE_LABELS[lane.lane] || ''
+  const source = SESSION_LANE_SOURCE_TEXT[lane.source] || SESSION_LANE_SOURCE_TEXT.project
+
+  return lane.note ? `${label} lane, ${source}: ${lane.note}` : `${label} lane, ${source}`
+}
+
+// The lookup every surface shares: a link row plus the project's ref map.
+function laneForLink(link, refs, projectLane) {
+  const number = Number(link && link.pr)
+  const pr = Number.isFinite(number) && number > 0 && refs ? refs.get(number) : null
+
+  return resolveSessionLane(link, pr, projectLane)
+}
+
+// Every session in a project, counted per lane. Linked rows resolve through the
+// helper; the sessions the links do not name still sit on the project lane, so
+// the tally covers the whole column rather than the visible cards only.
+function sessionLaneTally(sessionCount, links, refs, projectLane) {
+  const counts = { backlog: 0, active: 0, review: 0, blocked: 0, done: 0 }
+  let linked = 0
+
+  for (const link of links || []) {
+    if (!link || !link.session_id) continue
+    linked += 1
+    const lane = laneForLink(link, refs, projectLane)
+
+    if (lane) counts[lane.lane] += 1
+  }
+
+  const rest = Math.max(0, (Number(sessionCount) || 0) - linked)
+  const unnamed = rest > 0 ? resolveSessionLane(null, null, projectLane) : null
+
+  if (unnamed) counts[unnamed.lane] += rest
+
+  return counts
+}
+
+// One short line: the total, then at most two lane counts in signal order. The
+// project's own lane is left out, so the line names the sessions that differ
+// from the column rather than repeating its default.
+function sessionLaneSummary(sessionCount, counts, projectLane) {
+  const total = Number(sessionCount) || 0
+  const parts = total > 0 ? [`${total} ${total === 1 ? 'session' : 'sessions'}`] : []
+  const own = sessionLaneId(projectLane)
+
+  for (const lane of SESSION_LANE_TALLY_ORDER) {
+    if (lane === own) continue
+    if (parts.length >= 3) break
+    const n = counts && Number(counts[lane])
+    if (Number.isFinite(n) && n > 0) parts.push(`${n} ${lane}`)
+  }
+
+  return parts.join(' \u00b7 ')
+}
+// session-lane:end
 
 const LIVE_LABELS = {
   idle: 'Idle',
@@ -261,16 +392,22 @@ function writeStatus(projectId, status) {
 
 // A payload that is not the board shape (a 404 body, an older process) yields
 // null, which every consumer reads as "no server statuses, use storage".
+// `statuses` is a list of rows on the current store and was an id-keyed map on
+// older builds; both are read here, so one payload shape change never costs the
+// board its links.
 function boardStatusMap(payload) {
   const rows = payload && payload.statuses
 
-  if (!rows || typeof rows !== 'object' || Array.isArray(rows)) return null
+  if (!rows || typeof rows !== 'object') return null
+  const entries = Array.isArray(rows)
+    ? rows.map(row => [row && row.project_id, row])
+    : Object.entries(rows)
   const out = {}
 
-  for (const [id, row] of Object.entries(rows)) {
+  for (const [id, row] of entries) {
     const value = typeof row === 'string' ? row : row && row.status
 
-    if (STATUS_BY_ID[value]) out[id] = value
+    if (id && STATUS_BY_ID[value]) out[id] = value
   }
 
   return out
@@ -385,6 +522,104 @@ function linksByProject(links) {
   return map
 }
 
+// Session id → its link row. One row per session by construction, and the badge
+// only ever needs the newest link the board reports for it.
+function linksBySession(links) {
+  const map = new Map()
+
+  for (const link of links || []) {
+    if (!link || !link.session_id || map.has(link.session_id)) continue
+    map.set(link.session_id, link)
+  }
+
+  return map
+}
+
+// Project id → every link row, for the column tally whose total is the whole
+// project, not the five cards a column draws.
+function linkRowsByProject(links) {
+  const map = new Map()
+
+  for (const link of links || []) {
+    if (!link || !link.project_id) continue
+    const rows = map.get(link.project_id) || []
+
+    rows.push(link)
+    map.set(link.project_id, rows)
+  }
+
+  return map
+}
+
+// PR number → { state, merged, draft } in at most REF_BATCH_MAX per call, which
+// is the backend's own limit. A failed chunk (no route, no token, a rate limit)
+// is an empty map: the refinement simply does not happen and the project lane
+// answers instead.
+async function prStatesFor(folder, numbers) {
+  const out = new Map()
+
+  for (let i = 0; i < numbers.length; i += REF_BATCH_MAX) {
+    const slice = numbers.slice(i, i + REF_BATCH_MAX)
+    const query = `path=${encodeURIComponent(folder)}&numbers=${slice.join(',')}`
+    const data = await ghRest(`/github/refs?${query}`).catch(() => null)
+    const refs = data && data.ok && data.refs && typeof data.refs === 'object' ? data.refs : null
+
+    if (!refs) continue
+    for (const number of slice) {
+      const row = refs[String(number)]
+
+      if (row && typeof row === 'object') out.set(number, row)
+    }
+  }
+
+  return out
+}
+
+// One query for every project on the page: each project's linked PR numbers in
+// one batched refs read. Projects with no linked PR cost nothing, and the whole
+// map is empty until the backend answers.
+function useProjectRefs(projects, links) {
+  const plan = useMemo(() => {
+    const rows = linkRowsByProject(links)
+    const out = []
+
+    for (const project of projects || []) {
+      if (!project || !project.id) continue
+      const folder = primaryPath(project)
+      const numbers = []
+
+      for (const link of rows.get(project.id) || []) {
+        const number = Number(link.pr)
+
+        if (Number.isFinite(number) && number > 0 && !numbers.includes(number)) numbers.push(number)
+      }
+
+      if (folder && numbers.length > 0) out.push({ folder, id: project.id, numbers })
+    }
+
+    return out
+  }, [projects, links])
+
+  const sig = useMemo(() => plan.map(row => `${row.id}:${row.folder}:${row.numbers.join(',')}`).join('|'), [plan])
+
+  const query = useQuery({
+    enabled: plan.length > 0,
+    queryFn: () =>
+      Promise.all(plan.map(row => prStatesFor(row.folder, row.numbers))).then(list => {
+        const out = new Map()
+
+        for (let i = 0; i < plan.length; i += 1) out.set(plan[i].id, list[i])
+
+        return out
+      }),
+    queryKey: [QUERY_ROOT, 'github', 'lane-refs', sig],
+    retry: false,
+    staleTime: 60000
+  })
+
+  return useMemo(() => query.data || new Map(), [query.data])
+}
+
 // The tree changes rarely, so a debounce absorbs a burst of 15s polls. The
 // signature is the payload itself: an identical id/label/path set posts once, and
 // a failed post retries when the board comes back ($boardLive flips or the tree
@@ -467,10 +702,63 @@ function toMs(value) {
   return n < 1e12 ? n * 1000 : n
 }
 
-function ago(value) {
-  const ms = toMs(value)
+// One reader for every stamp the plugin prints: epoch seconds and milliseconds
+// from the gateway, ISO 8601 from GitHub and `git log --iso-strict`.
+function stampMs(value) {
+  if (value == null || value === '') return 0
+  if (typeof value === 'number') return toMs(value)
+  const str = String(value).trim()
 
-  return ms ? relativeTime(ms) : ''
+  if (/^\d+(\.\d+)?$/.test(str)) return toMs(str)
+  const parsed = Date.parse(str)
+
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+const MINUTE_MS = 60 * 1000
+const HOUR_MS = 60 * MINUTE_MS
+const DAY_MS = 24 * HOUR_MS
+const MONTH_MS = 30 * DAY_MS
+const YEAR_MS = 365 * DAY_MS
+
+// Short absolute date for anything a year or older, so `opened Mar 4, 2025`
+// still reads right.
+const fmtShortDate = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' })
+
+// The one relative age the UI prints. Floored, English, singular forms kept.
+// Ages refresh only when the view re-renders, which the existing 5 s activity
+// tick ($activityClock, below) already drives. Never wrap a call site in
+// React.memo or the text will freeze at mount time.
+function ageText(value, now = Date.now()) {
+  const ms = stampMs(value)
+
+  if (!ms) return ''
+  const diff = now - ms
+
+  // A stamp in the future is clock skew, not history.
+  if (diff < MINUTE_MS) return 'just now'
+  if (diff < HOUR_MS) {
+    const n = Math.floor(diff / MINUTE_MS)
+
+    return `${n} ${n === 1 ? 'min' : 'mins'} ago`
+  }
+  if (diff < DAY_MS) {
+    const n = Math.floor(diff / HOUR_MS)
+
+    return `${n} ${n === 1 ? 'hour' : 'hours'} ago`
+  }
+  if (diff < MONTH_MS) {
+    const n = Math.floor(diff / DAY_MS)
+
+    return `${n} ${n === 1 ? 'day' : 'days'} ago`
+  }
+  if (diff < YEAR_MS) {
+    const n = Math.min(11, Math.max(1, Math.floor(diff / MONTH_MS)))
+
+    return `${n} ${n === 1 ? 'month' : 'months'} ago`
+  }
+
+  return fmtShortDate.format(new Date(ms))
 }
 
 // `state.db` has no `last_active` column (started_at, ended_at,
@@ -626,12 +914,20 @@ const CSS_TEXT = `
 .pcc-gh-ref { transition: color 120ms ease, background-color 120ms ease; }
 .pcc-gh-ref:hover, .pcc-gh-ref:focus-visible { color: var(--ui-text-primary); background: color-mix(in srgb, var(--ui-stroke-secondary) 65%, transparent); outline: 1px solid var(--ui-accent); outline-offset: 1px; }
 .pcc-gh-back:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: 2px; }
+.pcc-branch-menu { opacity: 0.5; transition: opacity 120ms ease; }
+.pcc-gh-row:hover .pcc-branch-menu, .pcc-branch-menu:focus-visible, .pcc-branch-menu[data-state="open"] { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .pcc-branch-menu { transition: none; } }
 .pcc-gh-sub-btn:hover, .pcc-gh-sub-btn:focus-visible { background: var(--chrome-action-hover); outline: none; }
 .pcc-gh-linkbtn:hover, .pcc-gh-linkbtn:focus-visible { color: var(--ui-text-secondary); outline: none; }
 @keyframes pcc-gh-flash { from { background: color-mix(in srgb, var(--ui-accent) 14%, transparent); } to { background: transparent; } }
 .pcc-gh-focus { animation: pcc-gh-flash 1400ms ease-out 1 both; }
 @media (prefers-reduced-motion: reduce) { .pcc-gh-focus { animation: none !important; } }
 .pcc-gh-error > div:first-child { gap: 6px; }
+.pcc-graph-row { border: 0; background: transparent; transition: background-color 100ms ease; }
+.pcc-graph-row:hover { background: color-mix(in srgb, var(--chrome-action-hover) 70%, transparent); }
+.pcc-graph-row:focus-visible { outline: 1px solid var(--ui-accent); outline-offset: -2px; }
+.pcc-graph-scroll { scrollbar-width: thin; }
+.pcc-diff-scroll { scrollbar-width: thin; }
 `
 
 const S = {
@@ -752,6 +1048,24 @@ const S = {
     minWidth: 0
   },
   ellipsis: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 },
+  // The session lane badge: one 16px line box, so it sits inside a title line
+  // whose own line-height already clears 16px and never grows the row it is in.
+  laneBadge: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 5,
+    flex: 'none',
+    height: 16,
+    padding: '0 6px',
+    borderRadius: 999,
+    background: 'color-mix(in srgb, var(--ui-stroke-secondary) 22%, transparent)',
+    color: 'var(--ui-text-secondary)',
+    fontSize: '0.625rem',
+    fontWeight: 500,
+    lineHeight: 1,
+    whiteSpace: 'nowrap'
+  },
+  laneDot: { width: 5, height: 5, borderRadius: 999, flex: 'none', background: 'var(--ui-text-quaternary)' },
   more: {
     display: 'flex',
     alignItems: 'center',
@@ -833,6 +1147,10 @@ const S = {
     gap: 1,
     borderRadius: 10,
     overflow: 'hidden',
+    // A flex child shrinks to nothing before its parent scrolls, and this grid's
+    // overflow:hidden lets that shrink collapse it. Pin its height so a long tab
+    // list scrolls underneath instead of eating the summary block.
+    flex: 'none',
     border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent)',
     background: 'color-mix(in srgb, var(--ui-stroke-secondary) 70%, transparent)'
   },
@@ -902,6 +1220,32 @@ const S = {
   },
   ghHead: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 },
   ghToolbar: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', padding: '9px 0 2px', minWidth: 0 },
+  // The status filter row: text-only toggles, one size down from the tab strip,
+  // colour only on the ones that are on.
+  ghFilters: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', padding: '4px 0 2px', minWidth: 0 },
+  ghFilterBtn: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    height: 18,
+    padding: '0 6px',
+    border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 55%, transparent)',
+    borderRadius: 4,
+    background: 'transparent',
+    color: 'var(--ui-text-quaternary)',
+    fontSize: '0.625rem',
+    lineHeight: 1,
+    cursor: 'pointer'
+  },
+  ghFilterOn: {
+    background: 'color-mix(in srgb, currentColor 14%, transparent)',
+    border: '1px solid color-mix(in srgb, currentColor 45%, transparent)',
+    fontWeight: 600
+  },
+  ghFilterCount: {
+    fontSize: '0.625rem',
+    color: 'var(--ui-text-quaternary)',
+    fontVariantNumeric: 'tabular-nums'
+  },
   ghTotals: {
     display: 'flex',
     alignItems: 'center',
@@ -1035,6 +1379,7 @@ const S = {
     justifyContent: 'center',
     width: 16,
     height: 16,
+    flex: 'none',
     borderRadius: 999,
     background: 'color-mix(in srgb, var(--ui-stroke-secondary) 45%, transparent)',
     color: 'var(--ui-text-tertiary)',
@@ -1053,6 +1398,25 @@ const S = {
     fontWeight: 500,
     color: 'var(--ui-text-primary)',
     fontFamily: 'var(--font-mono, ui-monospace, monospace)'
+  },
+  ghCurrent: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    flex: 'none',
+    fontSize: '0.5625rem',
+    lineHeight: 1,
+    letterSpacing: '0.02em',
+    color: 'var(--ui-text-tertiary)'
+  },
+  ghCurrentDot: { width: 5, height: 5, borderRadius: 999, background: 'var(--ui-accent)' },
+  ghSessionBtn: {
+    flex: 'none',
+    height: 20,
+    padding: '0 4px',
+    gap: 3,
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-tertiary)'
   },
   ghSubject: {
     flex: '0 1 320px',
@@ -1196,6 +1560,23 @@ const S = {
   },
   ghComposerRow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 },
   ghComposerError: { fontSize: '0.75rem', lineHeight: 1.45, color: 'var(--dt-destructive)' },
+  branchField: { display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0 },
+  branchLabel: { fontSize: '0.6875rem', fontWeight: 600, letterSpacing: '0.02em', color: 'var(--ui-text-tertiary)' },
+  branchInput: {
+    width: '100%',
+    boxSizing: 'border-box',
+    padding: '6px 8px',
+    border: '1px solid var(--ui-stroke-secondary)',
+    borderRadius: 5,
+    outline: 'none',
+    background: 'var(--ui-bg-primary)',
+    color: 'var(--ui-text-primary)',
+    font: 'inherit',
+    fontSize: '0.8125rem'
+  },
+  branchNote: { fontSize: '0.75rem', lineHeight: 1.45, color: 'var(--ui-text-quaternary)' },
+  branchError: { fontSize: '0.75rem', lineHeight: 1.45, color: 'var(--dt-destructive)' },
+  branchActions: { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8, paddingTop: 4 },
   ghRefChip: {
     display: 'inline-flex',
     alignItems: 'center',
@@ -1299,7 +1680,189 @@ const S = {
     whiteSpace: 'nowrap',
     fontSize: '0.6875rem',
     color: 'var(--ui-text-tertiary)'
-  }
+  },
+  // The graph: fixed pixel rows over one SVG, so a lane crossing the 200th row
+  // still lands on the centre of its dot. Nothing here draws a border.
+  graphWrap: { display: 'flex', flexDirection: 'column', minWidth: 0 },
+  graphScroll: { maxHeight: 520, overflow: 'auto', position: 'relative', minWidth: 0 },
+  graphHeader: {
+    position: 'sticky',
+    top: 0,
+    zIndex: 2,
+    display: 'flex',
+    alignItems: 'center',
+    height: 22,
+    flex: 'none',
+    background: 'var(--ui-bg-editor)',
+    borderBottom: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 35%, transparent)',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    fontSize: '0.625rem',
+    color: 'var(--ui-text-quaternary)'
+  },
+  graphHeadCell: { flex: 'none', paddingLeft: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  graphRows: { position: 'relative', minWidth: 0 },
+  graphRowShape: {
+    position: 'relative',
+    zIndex: 1,
+    display: 'flex',
+    alignItems: 'center',
+    height: 26,
+    flex: 'none',
+    width: '100%',
+    minWidth: 0,
+    padding: 0,
+    font: 'inherit',
+    textAlign: 'left',
+    color: 'inherit',
+    cursor: 'pointer',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden'
+  },
+  graphGutter: {
+    flex: 'none',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 4,
+    paddingRight: 2,
+    minWidth: 0,
+    overflow: 'hidden'
+  },
+  graphLanes: { flex: 'none' },
+  graphSubject: {
+    flex: '1 1 0',
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    fontSize: '0.75rem',
+    color: 'var(--ui-text-primary)'
+  },
+  graphDate: {
+    flex: 'none',
+    // 86 keeps `Sep 30, 2026` (the year fallback for old commits) inside the
+    // column at 0.6875rem with the 8px right padding.
+    width: 86,
+    paddingRight: 8,
+    textAlign: 'right',
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-quaternary)',
+    fontVariantNumeric: 'tabular-nums',
+    whiteSpace: 'nowrap'
+  },
+  graphAuthor: {
+    flex: 'none',
+    width: 120,
+    display: 'flex',
+    alignItems: 'center',
+    gap: 5,
+    minWidth: 0,
+    overflow: 'hidden',
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-tertiary)'
+  },
+  graphAuthorName: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  graphHash: {
+    flex: 'none',
+    width: 62,
+    textAlign: 'right',
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-quaternary)',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    fontVariantNumeric: 'tabular-nums'
+  },
+  graphPill: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 3,
+    flex: 'none',
+    height: 16,
+    maxWidth: 140,
+    padding: '0 6px',
+    border: '1px solid',
+    borderRadius: 999,
+    background: 'transparent',
+    fontSize: '0.6875rem',
+    lineHeight: 1,
+    minWidth: 0
+  },
+  graphPillText: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  graphBadge: { flex: 'none', fontSize: '0.625rem', fontVariantNumeric: 'tabular-nums', lineHeight: 1 },
+  graphNote: { padding: '6px 2px', fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)' },
+  // Diff: three columns per line, theme tints per op, one scroll box per file.
+  diffFileHead: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    width: '100%',
+    minWidth: 0,
+    height: 24,
+    padding: '0 4px',
+    border: 0,
+    background: 'transparent',
+    color: 'inherit',
+    font: 'inherit',
+    textAlign: 'left',
+    cursor: 'pointer'
+  },
+  diffStatus: {
+    flex: 'none',
+    width: 12,
+    textAlign: 'center',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    fontSize: '0.6875rem',
+    fontWeight: 600
+  },
+  diffPath: {
+    flex: '1 1 auto',
+    minWidth: 0,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    fontSize: '0.6875rem',
+    color: 'var(--ui-text-secondary)'
+  },
+  diffCount: {
+    flex: 'none',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    fontSize: '0.625rem',
+    fontVariantNumeric: 'tabular-nums',
+    whiteSpace: 'nowrap'
+  },
+  diffBox: {
+    margin: '0 0 6px 18px',
+    border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary) 40%, transparent)',
+    borderRadius: 4,
+    overflow: 'hidden'
+  },
+  diffScroll: { maxHeight: 360, overflow: 'auto' },
+  diffHunk: {
+    padding: '2px 8px',
+    background: 'color-mix(in srgb, var(--ui-bg-quaternary) 55%, transparent)',
+    color: 'var(--ui-text-quaternary)',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    fontSize: '0.6875rem',
+    whiteSpace: 'pre'
+  },
+  diffLine: {
+    display: 'grid',
+    gridTemplateColumns: '40px 40px 1fr',
+    width: 'max-content',
+    minWidth: '100%',
+    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+    fontSize: '0.75rem',
+    lineHeight: '18px',
+    whiteSpace: 'pre'
+  },
+  diffNo: {
+    paddingRight: 8,
+    textAlign: 'right',
+    color: 'var(--ui-text-quaternary)',
+    fontVariantNumeric: 'tabular-nums',
+    userSelect: 'none'
+  },
+  diffText: { paddingRight: 12, paddingLeft: 8 }
 }
 
 // ── small pieces ─────────────────────────────────────────────────────────────
@@ -1387,9 +1950,10 @@ function Avatar({ project, size = 24 }) {
   })
 }
 
-function BranchChip({ branch }) {
+function BranchChip({ branch, title }) {
   return jsxs('span', {
     style: S.chip,
+    title,
     children: [
       jsx(Codicon, { name: 'git-branch', size: '0.75rem', style: { flex: 'none' } }),
       jsx('span', { style: S.ellipsis, children: branch })
@@ -1437,6 +2001,29 @@ function LiveDot({ state }) {
   return jsx(Tip, {
     label: LIVE_LABELS[state] || 'Live',
     children: jsx(StatusDot, { tone: liveTone(state) })
+  })
+}
+
+// Read-only on purpose: the plugin owns no per-session status control, so the
+// badge names the lane and where it came from instead of opening an editor.
+function LaneBadge({ lane }) {
+  if (!lane) return null
+  const label = SESSION_LANE_LABELS[lane.lane]
+
+  if (!label) return null
+  const title = sessionLaneTitle(lane)
+
+  return jsx(Tip, {
+    label: title,
+    children: jsxs('span', {
+      'aria-label': title,
+      className: 'pcc-lane',
+      style: S.laneBadge,
+      children: [
+        jsx('span', { 'aria-hidden': 'true', style: { ...S.laneDot, background: SESSION_LANE_VARS[lane.lane] } }),
+        label
+      ]
+    })
   })
 }
 
@@ -1517,7 +2104,7 @@ function SortPicker({ sort }) {
   })
 }
 
-function SessionCard({ session, state, showProject, onOpen }) {
+function SessionCard({ session, state, showProject, onOpen, lane }) {
   const ms = sessionStamp(session)
   const model = shortModel(session.model)
   const running = RUNNING.has(state)
@@ -1533,7 +2120,8 @@ function SessionCard({ session, state, showProject, onOpen }) {
         style: { display: 'flex', alignItems: 'flex-start', gap: 7, minWidth: 0 },
         children: [
           state && state !== 'idle' ? jsx('span', { style: { display: 'inline-flex', paddingTop: 5, flex: 'none' }, children: jsx(LiveDot, { state }) }) : null,
-          jsx('span', { style: S.cardTitle, children: sessionTitle(session) })
+          jsx('span', { style: S.cardTitle, children: sessionTitle(session) }),
+          lane ? jsx('span', { style: { display: 'inline-flex', flex: 'none', marginLeft: 'auto' }, children: jsx(LaneBadge, { lane }) }) : null
         ]
       }),
       jsxs('span', {
@@ -1541,7 +2129,7 @@ function SessionCard({ session, state, showProject, onOpen }) {
         children: [
           session.git_branch ? jsx(BranchChip, { branch: session.git_branch }) : null,
           showProject ? jsx('span', { style: S.ellipsis, children: showProject }) : null,
-          ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { children: ago(ms) }) }) : null,
+          ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { children: ageText(ms) }) }) : null,
           model ? jsx('span', { style: { ...S.ellipsis, maxWidth: 120 }, children: model }) : null
         ]
       })
@@ -1597,6 +2185,7 @@ function BoardLinkChips({ links }) {
 }
 
 const NO_COUNTS = {}
+const NO_LINKS = []
 const COUNTS_PATH_LIMIT = 50
 
 // ONE batched read for the whole board: every project's folder, a single
@@ -1678,11 +2267,22 @@ function ProjectIdRow({ counts, liveCount }) {
   })
 }
 
-function ProjectColumn({ project, index, status, liveByStored, onOpenProject, onOpenSession, links, counts }) {
+function ProjectColumn({ project, index, status, lane, linkRows, refs, liveByStored, onOpenProject, onOpenSession, links, counts }) {
   const recent = recentSessions(project)
   const shown = recent.slice(0, BOARD_CARD_LIMIT)
   const hidden = Math.max(0, (project.sessionCount || 0) - shown.length)
   const cost = formatCost(project.totalCostUsd)
+  // The badge for every row in this column, and the header line, come from the
+  // same resolver: explicit session status, then its PR, then the project lane.
+  const rowLinks = useMemo(() => linksBySession(linkRows), [linkRows])
+  const laneOf = useCallback(id => laneForLink(rowLinks.get(id), refs, lane), [rowLinks, refs, lane])
+  const tally = useMemo(
+    () => sessionLaneTally(project.sessionCount, linkRows, refs, lane),
+    [project.sessionCount, linkRows, refs, lane]
+  )
+  const summary =
+    sessionLaneSummary(project.sessionCount, tally, lane) ||
+    `${project.sessionCount || 0} ${project.sessionCount === 1 ? 'session' : 'sessions'}`
   const liveCount = useMemo(() => {
     let n = 0
 
@@ -1738,7 +2338,12 @@ function ProjectColumn({ project, index, status, liveByStored, onOpenProject, on
             children: [
               jsx(StatusPicker, { projectId: project.id, status }),
               jsx(BoardLinkChips, { links }),
-              jsx('span', { style: S.metricMono, children: `${project.sessionCount || 0} ${project.sessionCount === 1 ? 'session' : 'sessions'}` }),
+              summary
+                ? jsx(Tip, {
+                    label: 'Sessions per lane, the whole project',
+                    children: jsx('span', { style: S.metricMono, children: summary })
+                  })
+                : null,
               liveCount > 0
                 ? jsxs('span', {
                     style: { display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--ui-accent)' },
@@ -1757,12 +2362,12 @@ function ProjectColumn({ project, index, status, liveByStored, onOpenProject, on
           })
         ]
       }),
-      jsx(ColumnBody, { project, shown, hidden, liveByStored, onOpenProject, onOpenSession })
+      jsx(ColumnBody, { project, shown, hidden, laneOf, liveByStored, onOpenProject, onOpenSession })
     ]
   })
 }
 
-function ColumnBody({ project, shown, hidden, liveByStored, onOpenProject, onOpenSession }) {
+function ColumnBody({ project, shown, hidden, laneOf, liveByStored, onOpenProject, onOpenSession }) {
   return jsx('div', {
     style: { flex: '1 1 0', minHeight: 0, overflowY: 'auto', overflowX: 'hidden', scrollbarWidth: 'thin' },
     children: jsxs('div', {
@@ -1770,7 +2375,13 @@ function ColumnBody({ project, shown, hidden, liveByStored, onOpenProject, onOpe
       children: [
         shown.length === 0
           ? jsx('div', { style: S.quiet, children: 'No sessions yet' })
-          : shown.map(s => jsx(SessionCard, { onOpen: onOpenSession, session: s, state: liveByStored.get(s.id) }, s.id)),
+          : shown.map(s =>
+              jsx(
+                SessionCard,
+                { lane: laneOf(s.id), onOpen: onOpenSession, session: s, state: liveByStored.get(s.id) },
+                s.id
+              )
+            ),
         hidden > 0
           ? jsxs('button', {
               className: 'pcc-more',
@@ -1885,7 +2496,7 @@ function BoardSkeleton() {
 
 // ── live strip ───────────────────────────────────────────────────────────────
 
-function LiveStrip({ items, projectBySession, onOpenSession, loading }) {
+function LiveStrip({ items, projectBySession, onOpenSession, loading, laneFor }) {
   return jsxs('section', {
     'aria-label': 'Live sessions',
     style: S.strip,
@@ -1920,12 +2531,18 @@ function LiveStrip({ items, projectBySession, onOpenSession, loading }) {
                   children: [
                     jsx('span', { style: { display: 'inline-flex', flex: 'none' }, children: jsx(LiveDot, { state }) }),
                     jsx('span', { style: { ...S.ellipsis, flex: '1 1 0', fontWeight: 500 }, children: sessionTitle(item) }),
+                    laneFor
+                      ? jsx('span', {
+                          style: { display: 'inline-flex', flex: 'none' },
+                          children: jsx(LaneBadge, { lane: laneFor(item.session_key) })
+                        })
+                      : null,
                     project ? jsx('span', { style: { ...S.ellipsis, flex: '0 1 140px', color: 'var(--ui-text-secondary)' }, children: project }) : null,
                     model ? jsx('span', { style: { ...S.ellipsis, flex: '0 1 120px', color: 'var(--ui-text-quaternary)' }, children: model }) : null,
                     jsx('span', { style: { flex: 'none', width: 64, color: 'var(--ui-text-secondary)' }, children: LIVE_LABELS[state] || state }),
                     jsx('span', {
-                      style: { flex: 'none', width: 64, textAlign: 'right', color: 'var(--ui-text-quaternary)' },
-                      children: ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { children: ago(ms) }) }) : null
+                      style: { flex: 'none', width: 84, textAlign: 'right', whiteSpace: 'nowrap', color: 'var(--ui-text-quaternary)' },
+                      children: ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { children: ageText(ms) }) }) : null
                     })
                   ]
                 },
@@ -1975,26 +2592,495 @@ function useLiveSessions() {
   return { byStored, items, query }
 }
 
+// ── git graph layout ────────────────────────────────────────────────────────
+// The graph tab draws local history, so this block knows nothing about GitHub.
+// Input is the server's raw window (newest first, children before parents);
+// output is render-ready rows, band edges and SVG path strings.
+//
+// graph-layout:begin
+// Pure lane layout for the Git graph tab. No imports and no DOM, so the node
+// test can lift this block straight out of this file and run it as is.
+// Color keys are ref names or shas, never allocation order, so a refresh that
+// adds commits on top does not repaint the branches below it.
+
+const GRAPH_ROW_H = 26
+const GRAPH_LANE_W = 14
+const GRAPH_DOT_R = 3.5
+const GRAPH_STROKE = 1.75
+const GRAPH_MAX_LANES = 16
+const GRAPH_LANE_COLORS = [
+  'var(--ui-accent)',
+  'var(--ui-orange)',
+  'var(--ui-purple)',
+  'var(--ui-cyan)',
+  'var(--ui-green)',
+  'var(--ui-yellow)',
+  'var(--ui-red)',
+  'var(--ui-blue)'
+]
+
+function graphNumber(value, fallback) {
+  return typeof value === 'number' && isFinite(value) ? value : fallback
+}
+
+function graphRound(value) {
+  const n = Math.round(value * 1000) / 1000
+
+  return Object.is(n, -0) ? 0 : n
+}
+
+function graphHash(key) {
+  let h = 0x811c9dc5
+
+  for (let i = 0; i < key.length; i += 1) {
+    h ^= key.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+
+  return h >>> 0
+}
+
+function graphRefKind(ref) {
+  const name = String((ref && ref.name) || '')
+
+  if (name.indexOf('refs/heads/') === 0) return 'local'
+  if (name.indexOf('refs/remotes/') === 0) return 'remote'
+  if (name.indexOf('refs/tags/') === 0) return 'tag'
+  if (ref && ref.kind) return String(ref.kind)
+
+  return ''
+}
+
+function graphRefShort(ref) {
+  return String((ref && ref.short) || (ref && ref.name) || '')
+    .replace(/^refs\/heads\//, '')
+    .replace(/^refs\/remotes\//, '')
+    .replace(/^refs\/tags\//, '')
+}
+
+function graphRefTarget(refs) {
+  const list = Array.isArray(refs) ? refs : []
+
+  for (const ref of list) {
+    const name = String((ref && ref.name) || '')
+    const target = String((ref && (ref.symref || ref.target)) || '')
+    if (name.endsWith('/HEAD') && target) return target.replace(/^refs\/remotes\//, '')
+  }
+
+  return null
+}
+
+function graphBasename(name) {
+  const parts = String(name || '').split('/')
+
+  return parts[parts.length - 1] || ''
+}
+
+// Local branch first, then remote, both sorted so two refs on one commit cannot
+// race. Tags are labels, never lane keys.
+function graphBestRefName(list) {
+  if (!Array.isArray(list) || !list.length) return null
+
+  const local = list
+    .filter(ref => graphRefKind(ref) === 'local')
+    .map(graphRefShort)
+    .filter(short => short && !short.endsWith('/HEAD'))
+    .sort()
+  if (local.length) return local[0]
+
+  const remote = list
+    .filter(ref => graphRefKind(ref) === 'remote')
+    .map(graphRefShort)
+    .filter(short => short && !short.endsWith('/HEAD'))
+    .sort()
+  if (remote.length) return remote[0]
+
+  return null
+}
+
+// Trunk is the default branch's first parent chain. Prefer the local branch
+// when it sits on that chain, otherwise the remote tip, because the server's
+// default branch is usually origin/main and one straight line should cover both.
+function graphPickTrunkTip(refs, refsByName, head, defaultBranch, commits, index) {
+  const def = String(defaultBranch || graphRefTarget(refs) || '')
+  const remoteName = def && !def.startsWith('refs/') ? def.replace(/^refs\/remotes\//, '') : ''
+  const base = def ? graphBasename(remoteName || def) : ''
+  const candidates = []
+
+  if (base) candidates.push(base)
+  if (base !== 'main') candidates.push('main')
+  candidates.push('master')
+
+  let local = null
+  for (const name of candidates) {
+    const ref = refsByName.get(`refs/heads/${name}`)
+    if (ref && index.has(String(ref.sha))) {
+      local = ref
+      break
+    }
+  }
+
+  let remote = null
+  if (def) {
+    const names = def.startsWith('refs/') ? [def] : [`refs/remotes/${def}`]
+    if (!def.startsWith('refs/') && def.indexOf('/') === -1) names.push(`refs/remotes/origin/${def}`)
+    for (const name of names) {
+      const ref = refsByName.get(name)
+      if (ref && index.has(String(ref.sha))) {
+        remote = ref
+        break
+      }
+    }
+  }
+
+  if (local && remote && local.sha !== remote.sha) {
+    let cursor = String(remote.sha)
+    const seen = new Set()
+    while (cursor && index.has(cursor) && !seen.has(cursor)) {
+      if (cursor === String(local.sha)) return String(remote.sha)
+      seen.add(cursor)
+      const commit = commits[index.get(cursor)]
+      const parents = commit && Array.isArray(commit.parents) ? commit.parents : []
+      cursor = parents[0] != null ? String(parents[0]) : ''
+    }
+  }
+
+  if (local) return String(local.sha)
+  if (remote) return String(remote.sha)
+  if (head && index.has(String(head.sha))) return String(head.sha)
+
+  return null
+}
+
+// Base colour from the key, then step off a colour already worn by the lane on
+// either side. Colour 0 is the trunk and is never handed to a side track.
+function graphTrackColor(key, slots, lane) {
+  const base = 1 + (graphHash(String(key)) % 7)
+  let color = base
+
+  for (let step = 0; step < 7; step += 1) {
+    const left = lane > 0 && slots[lane - 1] && slots[lane - 1].track ? slots[lane - 1].track.color : -1
+    const right = slots[lane + 1] && slots[lane + 1].track ? slots[lane + 1].track.color : -1
+    if (color !== left && color !== right) return color
+    color = color === 7 ? 1 : color + 1
+  }
+
+  return base
+}
+
+function pccGraphLayout(input) {
+  const payload = input && typeof input === 'object' ? input : {}
+  const source = Array.isArray(payload.commits) ? payload.commits : []
+  const commits = source.map(commit => ({
+    ...commit,
+    parents: Array.isArray(commit && commit.parents) ? commit.parents.filter(parent => parent != null && parent !== '') : [],
+    sha: String((commit && commit.sha) || '')
+  }))
+  const count = commits.length
+  const index = new Map()
+
+  commits.forEach((commit, i) => {
+    if (commit.sha) index.set(commit.sha, i)
+  })
+
+  const refs = (Array.isArray(payload.refs) ? payload.refs : [])
+    .map(ref => ({
+      ...ref,
+      kind: graphRefKind(ref),
+      name: String((ref && ref.name) || ''),
+      sha: String((ref && ref.sha) || ''),
+      short: graphRefShort(ref)
+    }))
+    .filter(ref => {
+      if (!ref.sha || !index.has(ref.sha)) return false
+      if (ref.name.endsWith('/HEAD')) return false
+      return graphRefKind(ref) !== ''
+    })
+  // A symref HEAD is dropped from the drawable refs, so read its target from the
+  // raw payload before that filter runs.
+  const refTarget = graphRefTarget(Array.isArray(payload.refs) ? payload.refs : [])
+  const refsByName = new Map(refs.map(ref => [ref.name, ref]))
+  const refsBySha = new Map()
+  refs.forEach(ref => {
+    const list = refsBySha.get(ref.sha) || []
+    list.push(ref)
+    refsBySha.set(ref.sha, list)
+  })
+
+  const head = payload.head && typeof payload.head === 'object' ? payload.head : null
+  const trunkTip = graphPickTrunkTip(refs, refsByName, head, payload.default_branch || refTarget, commits, index)
+  const trunk = new Set()
+  const trunkSeen = new Set()
+  let cursor = trunkTip
+
+  while (cursor && index.has(cursor) && !trunkSeen.has(cursor)) {
+    trunkSeen.add(cursor)
+    trunk.add(cursor)
+    const commit = commits[index.get(cursor)]
+    cursor = commit.parents[0] != null ? String(commit.parents[0]) : ''
+  }
+
+  const slots = []
+  const rows = []
+  const bands = []
+  const freedThisRow = new Set()
+  const reserveZero = trunk.size > 0
+  const anomalies = []
+  let maxLanes = 0
+
+  const alloc = minIndex => {
+    let k = Math.max(0, minIndex)
+    for (; k < slots.length; k += 1) {
+      if (slots[k] == null && !freedThisRow.has(k)) return k
+    }
+    while (freedThisRow.has(k)) k += 1
+    return k
+  }
+
+  const allocRightOf = lane => {
+    let k = lane + 1
+    for (; k < slots.length; k += 1) {
+      if (slots[k] == null && !freedThisRow.has(k)) return k
+    }
+    while (freedThisRow.has(k)) k += 1
+    return k
+  }
+
+  for (let i = 0; i < count; i += 1) {
+    const commit = commits[i]
+    const sha = commit.sha
+    const parents = []
+    const seenParents = new Set()
+
+    for (const parent of commit.parents) {
+      const parentSha = String(parent)
+      if (!parentSha || seenParents.has(parentSha)) continue
+      const parentRow = index.get(parentSha)
+      if (parentRow != null && parentRow <= i) {
+        anomalies.push({ child: sha, childRow: i, parent: parentSha, parentRow, reason: 'parent_not_after_child' })
+        continue
+      }
+      seenParents.add(parentSha)
+      parents.push(parentSha)
+    }
+
+    const incoming = []
+    for (let k = 0; k < slots.length; k += 1) {
+      if (slots[k] && slots[k].sha === sha) incoming.push(k)
+    }
+
+    const born = new Set()
+    let lane
+
+    if (trunk.has(sha)) lane = 0
+    else if (incoming.length) {
+      lane = incoming.find(k => slots[k].firstParent)
+      if (lane == null) lane = incoming[0]
+    } else lane = alloc(reserveZero ? 1 : 0)
+
+    let track
+    if (incoming.indexOf(lane) !== -1 && slots[lane]) track = slots[lane].track
+    else if (lane === 0 && trunk.has(sha)) track = { color: 0, key: 'trunk' }
+    else {
+      const key = graphBestRefName(refsBySha.get(sha)) || sha
+      track = { color: graphTrackColor(key, slots, lane), key }
+    }
+
+    // Every other lane waiting for this commit is a fork converging from below.
+    const converging = incoming.filter(k => k !== lane)
+    for (const k of converging) {
+      slots[k] = null
+      freedThisRow.add(k)
+    }
+
+    const joins = []
+    if (parents.length) {
+      slots[lane] = { sha: parents[0], track, firstParent: true }
+      born.add(lane)
+    } else {
+      slots[lane] = null
+      freedThisRow.add(lane)
+    }
+
+    for (let p = 1; p < parents.length; p += 1) {
+      const parentSha = parents[p]
+      let existing = -1
+      for (let k = 0; k < slots.length; k += 1) {
+        if (slots[k] && slots[k].sha === parentSha) {
+          existing = k
+          break
+        }
+      }
+      if (existing !== -1) {
+        joins.push(existing)
+        continue
+      }
+      let slot = allocRightOf(lane)
+      if (reserveZero && slot === 0) slot = allocRightOf(0)
+      slots[slot] = {
+        sha: parentSha,
+        track: { color: graphTrackColor(parentSha, slots, slot), key: parentSha },
+        firstParent: false
+      }
+      born.add(slot)
+    }
+
+    while (slots.length && slots[slots.length - 1] == null) slots.pop()
+    maxLanes = Math.max(maxLanes, slots.length, lane + 1)
+
+    const rowRefs = (refsBySha.get(sha) || []).map(ref => ref.short)
+    rows.push({
+      after: slots.slice(),
+      born,
+      color: track.color,
+      converging,
+      freed: converging.concat(parents.length ? [] : [lane]),
+      isHead: Boolean(head && String(head.sha) === sha),
+      joins,
+      key: track.key,
+      lane,
+      refs: rowRefs,
+      sha
+    })
+    freedThisRow.clear()
+  }
+
+  // One band per row. The last one runs to the bottom edge, so an open parent
+  // becomes a fading stub instead of a false dot.
+  for (let i = 0; i < count; i += 1) {
+    const row = rows[i]
+    const next = i + 1 < count ? rows[i + 1] : null
+    const band = []
+
+    for (let k = 0; k < row.after.length; k += 1) {
+      const slot = row.after[k]
+      if (!slot) continue
+      const from = row.born.has(k) ? row.lane : k
+      const to = next && slot.sha === next.sha ? next.lane : k
+      band.push({ color: slot.track.color, from, sha: slot.sha, slot: k, stub: !next, to })
+    }
+    for (const m of row.joins) {
+      const slot = row.after[m]
+      if (!slot) continue
+      const to = next && slot.sha === next.sha ? next.lane : m
+      band.push({ color: slot.track.color, from: row.lane, join: true, sha: slot.sha, slot: m, stub: !next, to })
+    }
+    bands.push(band)
+  }
+
+  return { anomalies: anomalies.length, anomalyList: anomalies, bands, maxLanes, rows, trunkSize: trunk.size }
+}
+
+// Geometry: symmetric cubics with vertical tangents at both dots, one row pitch
+// per band. A lane index past the limit pins to the right edge; its dot is
+// returned separately so the view can draw it hollow.
+function pccGraphPaths(layout, geometry) {
+  const rows = layout && Array.isArray(layout.rows) ? layout.rows : []
+  const bands = layout && Array.isArray(layout.bands) ? layout.bands : []
+  const geom = geometry && typeof geometry === 'object' ? geometry : {}
+  const rowH = graphNumber(geom.rowH, GRAPH_ROW_H)
+  const laneW = graphNumber(geom.laneW, GRAPH_LANE_W)
+  const dotR = graphNumber(geom.dotR, GRAPH_DOT_R)
+  const labelGutter = graphNumber(geom.labelGutter, 0)
+  const requested = graphNumber(geom.maxLanes, graphNumber(layout && layout.maxLanes, 1))
+  const limit = Math.max(1, Math.min(requested, GRAPH_MAX_LANES))
+  const gutter = labelGutter > 0 ? labelGutter + 8 : 0
+  const width = gutter + limit * laneW + 8
+  const height = rows.length * rowH
+  const x = k => gutter + Math.min(Math.max(k, 0), limit - 1) * laneW + laneW / 2
+  const y = i => i * rowH + rowH / 2
+  const byColor = {}
+  const dotsByColor = {}
+  let headRing = ''
+  let leaders = ''
+  let clippedDots = ''
+
+  const add = (bucket, key, d) => {
+    const name = String(key)
+    bucket[name] = bucket[name] ? `${bucket[name]} ${d}` : d
+  }
+
+  bands.forEach((band, i) => {
+    const y0 = y(i)
+    const y1 = i + 1 < rows.length ? y(i + 1) : height
+    for (const edge of band || []) {
+      const x0 = graphRound(x(edge.from))
+      const x1 = graphRound(x(edge.to))
+      const d =
+        x0 === x1
+          ? `M ${x0} ${graphRound(y0)} V ${graphRound(y1)}`
+          : `M ${x0} ${graphRound(y0)} C ${x0} ${graphRound((y0 + y1) / 2)}, ${x1} ${graphRound((y0 + y1) / 2)}, ${x1} ${graphRound(y1)}`
+      add(byColor, edge.color, d)
+    }
+  })
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i]
+    const cx = graphRound(x(row.lane))
+    const cy = graphRound(y(i))
+    const circle = graphCircle(cx, cy, dotR)
+    if (row.lane < limit) add(dotsByColor, row.color, circle)
+    else clippedDots = clippedDots ? `${clippedDots} ${circle}` : circle
+    if (row.isHead && !headRing) headRing = graphCircle(cx, cy, dotR + 1)
+  }
+
+  if (labelGutter > 0) {
+    for (let i = 0; i < rows.length; i += 1) {
+      const row = rows[i]
+      if (!row.refs || !row.refs.length) continue
+      const cy = graphRound(y(i))
+      const x1 = graphRound(x(row.lane) - dotR - 1)
+      const x0 = graphRound(labelGutter)
+      if (x1 > x0) leaders = leaders ? `${leaders} M ${x0} ${cy} H ${x1}` : `M ${x0} ${cy} H ${x1}`
+    }
+  }
+
+  return {
+    byColor,
+    clippedDots,
+    dotsByColor,
+    headRing,
+    height: graphRound(height),
+    leaders,
+    maxLanes: limit,
+    width: graphRound(width)
+  }
+}
+
+function graphCircle(cx, cy, r) {
+  const left = graphRound(cx - r)
+  const right = graphRound(cx + r)
+  const radius = graphRound(r)
+  const center = graphRound(cy)
+
+  return `M ${left} ${center} A ${radius} ${radius} 0 1 0 ${right} ${center} A ${radius} ${radius} 0 1 0 ${left} ${center} Z`
+}
+// graph-layout:end
+
 // ── github section ───────────────────────────────────────────────────────────
-// Two reads for one project folder: /github for the open board and /github with
-// state=closed for the shipped list. Both are joined against the sessions the
-// detail page already loaded (by git_branch) and against /repo's branch list.
+// One read for one project folder: /github with state=all carries the open and
+// the closed half together, so every tab filter is a local cut of the same
+// payload. It is joined against the sessions the detail page already loaded (by
+// git_branch) and against /repo's branch list.
 //
 // A payload can carry `error` (no remote, no auth, a rate limit): that renders as
 // a quiet line. Only a THROWN request means the backend is not mounted yet, and
 // that is the one case that gets the error row. Nothing here writes.
 
-const GH_PRESET_KEY = 'githubPreset.v1'
-const DEFAULT_GH_PRESET = 'flight'
+const GH_PRESET_KEY = 'githubPreset.v2'
+// v1 stored the pre-rename ids. The three that were renamed map across so an
+// upgrade keeps the reader on the tab they were on; anything else falls back.
+const LEGACY_GH_PRESET_KEY = 'githubPreset.v1'
+const GH_PRESET_ALIASES = { flight: 'prs', issue: 'issues', branch: 'branches' }
+const DEFAULT_GH_PRESET = 'prs'
 const GH_PRESETS = [
-  { id: 'flight', label: 'In flight' },
-  { id: 'issue', label: 'By issue' },
-  { id: 'branch', label: 'By branch' },
-  { id: 'unlinked', label: 'Unlinked' },
-  { id: 'shipped', label: 'Shipped' }
+  { id: 'issues', label: 'Issues' },
+  { id: 'prs', label: 'Pull Requests' },
+  { id: 'branches', label: 'Branches' },
+  { id: 'graph', label: 'Graph' },
+  { id: 'unlinked', label: 'Unlinked' }
 ]
 const GH_LIMIT = 50
-const SHIPPED_CAP = 20
 const BRANCH_CAP = 25
 const PR_FILES_SHOWN = 8
 // #123 references: a chip is only ever drawn for a number /github/refs resolved,
@@ -2018,9 +3104,15 @@ const $ghPreset = atom(DEFAULT_GH_PRESET)
 const $ghPoke = atom(null)
 
 function readGhPreset() {
-  const raw = pluginCtx ? pluginCtx.storage.get(GH_PRESET_KEY, DEFAULT_GH_PRESET) : DEFAULT_GH_PRESET
+  if (!pluginCtx) return DEFAULT_GH_PRESET
+  const raw = pluginCtx.storage.get(GH_PRESET_KEY, '')
+  if (GH_PRESETS.some(p => p.id === raw)) return raw
+  // Unlinked and Graph kept their ids, so a v1 value may still name a live tab.
+  const legacy = pluginCtx.storage.get(LEGACY_GH_PRESET_KEY, '')
+  if (GH_PRESETS.some(p => p.id === legacy)) return legacy
+  const migrated = GH_PRESET_ALIASES[legacy]
 
-  return GH_PRESETS.some(p => p.id === raw) ? raw : DEFAULT_GH_PRESET
+  return GH_PRESETS.some(p => p.id === migrated) ? migrated : DEFAULT_GH_PRESET
 }
 
 function writeGhPreset(presetId) {
@@ -2051,6 +3143,7 @@ function ghFailureText(data, folder) {
 
   if (code === 'folder_missing') return { text: `Folder not found: ${(data && data.path) || folder || ''}` }
   if (code === 'not_a_repo') return { text: 'Not a git repository' }
+  if (code === 'empty_repo') return { text: 'No commits yet' }
   if (code === 'no_remote') return { text: 'No GitHub remote' }
   if (code === 'repo_not_found') {
     const named = account && err && !err.includes(account) ? `${err} (as ${account})` : err
@@ -2076,25 +3169,21 @@ function ghNumber(n) {
   return `#${Number(n) || 0}`
 }
 
-// GitHub and `git log --iso-strict` hand back ISO 8601, while the gateway uses
-// epoch seconds. `toMs` only knows the latter, so the GitHub side gets its own
-// reader and a matching age formatter.
-function ghMs(value) {
-  if (value == null || value === '') return 0
-  if (typeof value === 'number') return toMs(value)
-  const str = String(value).trim()
-
-  if (/^\d+(\.\d+)?$/.test(str)) return toMs(str)
-  const parsed = Date.parse(str)
-
-  return Number.isFinite(parsed) ? parsed : 0
+// One section head for every modal (thread and commit): glyph, label, optional
+// count. Same markup the thread closure used, lifted so both dialogs read alike.
+function ghHead(icon, text, count) {
+  return jsxs('div', {
+    style: S.ghSectionHead,
+    children: [
+      jsx(Codicon, { name: icon, size: '0.75rem', style: { flex: 'none' } }),
+      jsx('span', { children: text }),
+      count != null ? jsx('span', { style: S.count, children: count }) : null
+    ]
+  })
 }
 
-function ghAgo(value) {
-  const ms = ghMs(value)
-
-  return ms ? relativeTime(ms) : ''
-}
+// `stampMs` and `ageText` above read GitHub's ISO 8601 as well as the gateway's
+// epoch seconds, so the GitHub side needs no helper of its own.
 
 function ghInitials(login) {
   const parts = String(login || '').split(/[-_. ]+/).filter(Boolean)
@@ -2114,13 +3203,139 @@ function ghChecksTip(checks) {
   return `${failing} failing of ${total} checks`
 }
 
-function ghPrLook(pr) {
-  if (pr.merged) return { name: 'git-merge', color: 'var(--ui-accent)' }
-  if (pr.state === 'closed') return { name: 'git-pull-request-closed', color: 'var(--ui-text-quaternary)' }
-  if (pr.draft) return { name: 'git-pull-request-draft', color: 'var(--ui-text-tertiary)' }
-
-  return { name: 'git-pull-request', color: 'var(--ui-text-secondary)' }
+// github-status:begin
+// One place for GitHub's status vocabulary, shared by every glyph (row, ref
+// pill, modal header) and by the tab filter rows. GitHub's dark palette, named
+// once: open green, merged or closed as completed purple, closed as not planned
+// or duplicate red, draft grey. The app exposes no theme variable for these, so
+// these are the values.
+const GH_STATUS_COLORS = {
+  open: '#3fb950',
+  merged: '#a371f7',
+  closed: '#a371f7',
+  not_planned: '#f85149',
+  duplicate: '#f85149',
+  draft: '#8b949e',
+  unknown: '#8b949e'
 }
+
+const GH_STATUS_LABELS = {
+  open: 'Open',
+  merged: 'Merged',
+  closed: 'Closed',
+  not_planned: 'Closed as not planned',
+  duplicate: 'Closed as duplicate',
+  draft: 'Draft',
+  unknown: 'Unknown'
+}
+
+// issue: Open, Closed. pr: Open, Merged, Closed, Draft. `closed` on a pull
+// request includes merged rows, as GitHub's own Closed filter does.
+const GH_STATUS_FILTERS = {
+  issue: [{ id: 'open', label: 'Open' }, { id: 'closed', label: 'Closed' }],
+  pr: [
+    { id: 'open', label: 'Open' },
+    { id: 'merged', label: 'Merged' },
+    { id: 'closed', label: 'Closed' },
+    { id: 'draft', label: 'Draft' }
+  ]
+}
+
+function ghStatusKind(kind) {
+  return kind === 'pr' ? 'pr' : 'issue'
+}
+
+// The colour bucket. A draft PR is grey while it is open, and a closed one
+// reads as closed; a merged PR is always purple whichever half it came from.
+function ghStatusKey(kind, row) {
+  const item = row || {}
+  const state = String(item.state || '').toLowerCase()
+  if (ghStatusKind(kind) === 'pr') {
+    if (item.merged === true || state === 'merged') return 'merged'
+    if (state === 'closed') return 'closed'
+    if (item.draft === true) return 'draft'
+    if (state === 'open') return 'open'
+
+    return 'unknown'
+  }
+  if (state === 'closed') {
+    const reason = String(item.state_reason || '').toLowerCase().replace(/[\s-]+/g, '_')
+    if (reason === 'duplicate') return 'duplicate'
+    if (reason === 'not_planned' || reason === 'notplanned') return 'not_planned'
+
+    return 'closed'
+  }
+  if (state === 'open') return 'open'
+
+  return 'unknown'
+}
+
+function ghStatusColor(kind, row) {
+  return GH_STATUS_COLORS[ghStatusKey(kind, row)]
+}
+
+function ghStatusLabel(kind, row) {
+  return GH_STATUS_LABELS[ghStatusKey(kind, row)]
+}
+
+// The Badge variant that pairs with the colour, for the places a badge sits
+// beside a glyph. The glyph colour stays the precise signal.
+function ghStatusVariant(kind, row) {
+  const key = ghStatusKey(kind, row)
+  if (key === 'open') return 'success'
+  if (key === 'not_planned' || key === 'duplicate') return 'destructive'
+
+  return 'muted'
+}
+
+// The glyph and its colour: one call site shape for every icon in the section.
+// The issue glyph never changes, only its colour; a PR swaps glyph by state the
+// way GitHub does.
+function ghStatusLook(kind, row) {
+  const key = ghStatusKey(kind, row)
+  const glyph =
+    ghStatusKind(kind) === 'pr'
+      ? key === 'merged'
+        ? 'git-merge'
+        : key === 'closed'
+          ? 'git-pull-request-closed'
+          : key === 'draft'
+            ? 'git-pull-request-draft'
+            : 'git-pull-request'
+      : 'issues'
+
+  return { key, name: glyph, color: GH_STATUS_COLORS[key], label: GH_STATUS_LABELS[key] }
+}
+
+// Which filter ticks a row answers to. A merged PR answers Merged and Closed; an
+// open draft answers Open and Draft, so the default (Open) view still shows
+// drafts exactly as it did before. A row that cannot be classified answers Open,
+// so it is never silently dropped.
+function ghStatusBuckets(kind, row) {
+  const item = row || {}
+  const state = String(item.state || '').toLowerCase()
+  if (ghStatusKind(kind) === 'pr') {
+    if (item.merged === true || state === 'merged') return ['merged', 'closed']
+    if (state === 'closed') return ['closed']
+    if (item.draft === true) return ['open', 'draft']
+    if (state === 'open') return ['open']
+
+    return ['open']
+  }
+
+  return [state === 'closed' ? 'closed' : 'open']
+}
+
+// The union the filter row promises: a row is shown when ANY ticked status
+// names it. No ticks means no filter at all, never an empty list.
+function ghFilterRows(kind, rows, selected) {
+  const ticks = selected instanceof Set ? selected : new Set(selected || [])
+  const list = Array.isArray(rows) ? rows : []
+  if (ticks.size === 0) return list
+
+  return list.filter(row => ghStatusBuckets(kind, row).some(bucket => ticks.has(bucket)))
+}
+// github-status:end
 
 // Inverted prs[].linked_issues: one pass per board read, used by every preset.
 function ghLinkedPrMap(prs) {
@@ -2182,15 +3397,15 @@ function ghBranchRows({ branches, prs, sessionsByBranch }) {
 
     if (!row) continue
     row.local = branch
-    row.stamp = Math.max(row.stamp, ghMs(branch.last_commit_at))
+    row.stamp = Math.max(row.stamp, stampMs(branch.last_commit_at))
   }
 
   for (const pr of prs || []) {
     const row = ensure(pr.head_ref)
 
     if (!row) continue
-    if (!row.pr || ghMs(pr.updated_at) > ghMs(row.pr.updated_at)) row.pr = pr
-    row.stamp = Math.max(row.stamp, ghMs(pr.updated_at))
+    if (!row.pr || stampMs(pr.updated_at) > stampMs(row.pr.updated_at)) row.pr = pr
+    row.stamp = Math.max(row.stamp, stampMs(pr.updated_at))
   }
 
   for (const [name, sessions] of sessionsByBranch) {
@@ -2250,8 +3465,9 @@ function GhSessions({ row }) {
   })
 }
 
-// Interactive when the caller can navigate (In flight), a plain tag when the
-// target may not be in the open list (Shipped). No dead buttons either way.
+// Interactive when the caller can navigate and the target is in the loaded
+// board (open or closed), a plain tag when the preset cannot reach it. No dead
+// buttons either way.
 function GhIssueChips({ numbers, onIssue, limit = 3 }) {
   const list = numbers || []
 
@@ -2380,16 +3596,8 @@ function ghKindWord(kind) {
   return kind === 'pr' ? 'pull request' : 'issue'
 }
 
-function ghKindGlyph(kind) {
-  return kind === 'pr' ? 'git-pull-request' : 'issues'
-}
-
-function ghStateTone(state) {
-  return String(state || '').toLowerCase() === 'open' ? 'good' : 'muted'
-}
-
 function ghWhen(value) {
-  const ms = ghMs(value)
+  const ms = stampMs(value)
 
   return ms ? fmtDateTime.format(new Date(ms)) : ''
 }
@@ -2536,8 +3744,11 @@ function GhRefChip({ entry, folder, onOpen }) {
           title: `${ghNumber(number)} ${title}`,
           type: 'button',
           children: [
-            jsx(StatusDot, { tone: ghStateTone(entry.state) }),
-            jsx(Codicon, { name: ghKindGlyph(kind), size: '0.625rem', style: { flex: 'none' } }),
+            jsx(Codicon, {
+              name: ghStatusLook(kind, entry).name,
+              size: '0.625rem',
+              style: { color: ghStatusLook(kind, entry).color, flex: 'none' }
+            }),
             jsx('span', { style: S.ghRefText, children: `${ghNumber(number)} · ${title || ghKindWord(kind)}` })
           ]
         })
@@ -2553,13 +3764,17 @@ function GhRefChip({ entry, folder, onOpen }) {
             jsxs('div', {
               style: S.ghPopHead,
               children: [
-                jsx(Codicon, { name: ghKindGlyph(kind), size: '0.6875rem', style: { flex: 'none' } }),
+                jsx(Codicon, {
+                  name: ghStatusLook(kind, entry).name,
+                  size: '0.6875rem',
+                  style: { color: ghStatusLook(kind, entry).color, flex: 'none' }
+                }),
                 jsx('span', { style: S.ghPopKind, children: ghKindWord(kind) }),
                 jsx('span', { style: S.ghPopNum, children: ghNumber(number) }),
                 jsx(Badge, {
-                  children: String(entry.state || '').toLowerCase() === 'closed' ? 'closed' : 'open',
+                  children: ghStatusLabel(kind, entry),
                   size: 'xs',
-                  variant: ghStateTone(entry.state) === 'good' ? 'success' : 'muted'
+                  variant: ghStatusVariant(kind, entry)
                 })
               ]
             }),
@@ -2567,8 +3782,16 @@ function GhRefChip({ entry, folder, onOpen }) {
             jsxs('div', {
               style: S.ghPopMeta,
               children: [
-                entry.author ? jsx('span', { children: entry.author }) : null,
-                entry.updated_at ? jsx('span', { children: `updated ${ghAgo(entry.updated_at)}` }) : null
+                entry.author
+                  ? jsxs('span', {
+                      style: S.ghActorRow,
+                      children: [
+                        jsx(GhMiniAvatar, { bot: entry.author_bot, login: entry.author, size: 14, src: entry.author_avatar }),
+                        jsx('span', { children: entry.author })
+                      ]
+                    })
+                  : null,
+                entry.updated_at ? jsx('span', { title: ghWhen(entry.updated_at), children: `updated ${ageText(entry.updated_at)}` }) : null
               ]
             }),
             body ? jsx('div', { style: S.ghPopBody, children: body }) : null,
@@ -2588,14 +3811,52 @@ function GhRefChip({ entry, folder, onOpen }) {
   })
 }
 
-function GhMiniAvatar({ login }) {
-  const name = String(login || 'ghost')
+// GitHub serves avatars from one host with one size (s=48), so the renderer
+// loads them directly, the way the app's own CatalogImage does. A URL that
+// failed once is remembered for the rest of the session: a remount must not
+// flash a broken box or retry a dead image.
+const failedAvatars = new Set()
 
-  return jsx(Blobatar, { name, size: 16, title: name })
+function GhMiniAvatar({ bot, fallback = 'blob', login, size = 16, src }) {
+  const name = String(login || 'ghost')
+  const url = typeof src === 'string' ? src : ''
+  const [failed, setFailed] = useState(false)
+  const box = { flex: 'none', height: size, width: size }
+
+  // An assignee cell kept initials before avatars existed, so it keeps them when
+  // there is nothing to load.
+  if (!url || failed || failedAvatars.has(url)) {
+    return fallback === 'initials'
+      ? jsx('span', { style: S.ghInitials, title: name, children: ghInitials(name) })
+      : jsx(Blobatar, { name, size, title: name })
+  }
+
+  return jsx('img', {
+    alt: name,
+    decoding: 'async',
+    height: size,
+    loading: 'lazy',
+    // Humans keep the circle Blobatar draws; a bot's app logo is a rounded square.
+    onError: () => {
+      failedAvatars.add(url)
+      setFailed(true)
+    },
+    referrerPolicy: 'no-referrer',
+    src: url,
+    style: {
+      ...box,
+      background: 'var(--ui-bg-quaternary)',
+      borderRadius: bot ? 4 : '50%',
+      display: 'block',
+      objectFit: 'cover'
+    },
+    title: name,
+    width: size
+  })
 }
 
 function GhComment({ comment, decorate, refKey }) {
-  const at = ghAgo(comment.created_at)
+  const at = ageText(comment.created_at)
 
   return jsxs('div', {
     style: S.ghComment,
@@ -2603,7 +3864,7 @@ function GhComment({ comment, decorate, refKey }) {
       jsxs('div', {
         style: S.ghCommentHead,
         children: [
-          jsx(GhMiniAvatar, { login: comment.author }),
+          jsx(GhMiniAvatar, { bot: comment.author_bot, login: comment.author, src: comment.author_avatar }),
           jsx('span', { style: S.ghActor, children: comment.author || 'ghost' }),
           at ? jsx('span', { style: S.ghTiny, title: ghWhen(comment.created_at), children: at }) : null
         ]
@@ -2621,7 +3882,7 @@ function GhComment({ comment, decorate, refKey }) {
 
 function GhReviewEntry({ decorate, refKey, review }) {
   const view = ghReviewView(review.state)
-  const at = ghAgo(review.submitted_at)
+  const at = ageText(review.submitted_at)
 
   return jsxs('div', {
     style: S.ghComment,
@@ -2629,7 +3890,7 @@ function GhReviewEntry({ decorate, refKey, review }) {
       jsxs('div', {
         style: S.ghCommentHead,
         children: [
-          jsx(GhMiniAvatar, { login: review.author }),
+          jsx(GhMiniAvatar, { bot: review.author_bot, login: review.author, src: review.author_avatar }),
           jsx('span', { style: S.ghActor, children: review.author || 'ghost' }),
           jsx(Badge, { size: 'xs', variant: view.variant, children: view.label }),
           at ? jsx('span', { style: S.ghTiny, title: ghWhen(review.submitted_at), children: at }) : null
@@ -2668,8 +3929,11 @@ function GhModalMeta({ detail, kind, onOpen }) {
   const labels = Array.isArray(detail.labels) ? detail.labels : []
   const shown = labels.slice(0, GH_LABEL_CHIPS)
   const assignees = Array.isArray(detail.assignees) ? detail.assignees : []
-  const created = ghWhen(detail.created_at)
-  const updated = ghWhen(detail.updated_at)
+  const assigneeAvatars = detail.assignee_avatars && typeof detail.assignee_avatars === 'object' ? detail.assignee_avatars : {}
+  const createdMs = stampMs(detail.created_at)
+  const updatedMs = stampMs(detail.updated_at)
+  const created = createdMs ? ageText(createdMs) : ''
+  const updated = updatedMs ? ageText(updatedMs) : ''
   const checks = detail.checks
   const linked = kind === 'pr' ? detail.linked_issues || [] : detail.linked_prs || []
   const other = kind === 'pr' ? 'issue' : 'pr'
@@ -2681,11 +3945,14 @@ function GhModalMeta({ detail, kind, onOpen }) {
       detail.author
         ? jsxs('span', {
             style: S.ghActorRow,
-            children: [jsx(GhMiniAvatar, { login: detail.author }), jsx('span', { style: S.ghActor, children: detail.author })]
+            children: [
+              jsx(GhMiniAvatar, { bot: detail.author_bot, login: detail.author, src: detail.author_avatar }),
+              jsx('span', { style: S.ghActor, children: detail.author })
+            ]
           })
         : null,
-      created ? jsx('span', { style: S.ghTiny, title: ghAgo(detail.created_at), children: `opened ${created}` }) : null,
-      updated ? jsx('span', { style: S.ghTiny, title: ghAgo(detail.updated_at), children: `updated ${updated}` }) : null,
+      created ? jsx('span', { style: S.ghTiny, title: ghWhen(detail.created_at), children: `opened ${created}` }) : null,
+      updated ? jsx('span', { style: S.ghTiny, title: ghWhen(detail.updated_at), children: `updated ${updated}` }) : null,
       ...shown.map((label, i) => jsx('span', { style: S.ghLabel, children: String(label) }, `${label}-${i}`)),
       labels.length > shown.length ? jsx('span', { style: S.ghTiny, children: `+${labels.length - shown.length}` }) : null,
       assignees.length > 0
@@ -2693,7 +3960,9 @@ function GhModalMeta({ detail, kind, onOpen }) {
             style: S.ghActorRow,
             title: assignees.join(', '),
             children: [
-              jsx(Codicon, { name: 'person', size: '0.6875rem', style: { flex: 'none' } }),
+              ...assignees.slice(0, 3).map(login =>
+                jsx(GhMiniAvatar, { login, src: assigneeAvatars[login] }, `assignee-${login}`)
+              ),
               jsx('span', { style: S.ghActor, children: assignees.join(', ') })
             ]
           })
@@ -2796,15 +4065,7 @@ function GhDetailThread({ detail, folder, kind, number, onOpen, owner, repo }) {
     }
   })
 
-  const head = (icon, text, count) =>
-    jsxs('div', {
-      style: S.ghSectionHead,
-      children: [
-        jsx(Codicon, { name: icon, size: '0.75rem', style: { flex: 'none' } }),
-        jsx('span', { children: text }),
-        count != null ? jsx('span', { style: S.count, children: count }) : null
-      ]
-    })
+  const head = ghHead
 
   return jsxs('div', {
     style: S.ghThread,
@@ -2925,7 +4186,6 @@ function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, r
   const failed = payload && ((payload.code && payload.code !== 'ok') || payload.error) ? payload : null
   const detail = payload && !failed ? payload : null
   const title = (detail && detail.title) || `${ghKindWord(kind)} ${ghNumber(number)}`
-  const state = detail ? String(detail.state || 'open').toLowerCase() : ''
   const url = detail && detail.url ? String(detail.url) : ''
   const canOpenExternal = Boolean(pluginCtx && pluginCtx.os && typeof pluginCtx.os.openExternal === 'function')
   const openExternal = () => {
@@ -2960,14 +4220,21 @@ function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, r
                         type: 'button',
                         children: jsx(Codicon, { name: 'chevron-left', size: '0.875rem' })
                       })
-                    : jsx(Codicon, {
-                        name: ghKindGlyph(kind),
-                        size: '0.875rem',
-                        style: { flex: 'none', color: 'var(--ui-text-secondary)', paddingTop: 2 }
-                      }),
+                    : null,
+                  jsx(Codicon, {
+                    name: ghStatusLook(kind, detail || {}).name,
+                    size: '0.875rem',
+                    style: { flex: 'none', color: ghStatusLook(kind, detail || {}).color, paddingTop: 2 }
+                  }),
                   jsx('span', { style: S.ghModalNum, children: ghNumber(number) }),
                   jsx(DialogTitle, { style: S.ghModalTitle, children: title }),
-                  detail ? jsx(Badge, { size: 'xs', variant: state === 'open' ? 'success' : 'muted', children: state || 'unknown' }) : null,
+                  detail
+                    ? jsx(Badge, {
+                        children: ghStatusLabel(kind, detail),
+                        size: 'xs',
+                        variant: ghStatusVariant(kind, detail)
+                      })
+                    : null,
                   url && canOpenExternal
                     ? jsxs('button', {
                         className: 'pcc-gh-chip',
@@ -3002,9 +4269,439 @@ function GhDetailModal({ depth, entry, folder, onBack, onClose, onOpen, owner, r
   })
 }
 
+const GRAPH_COMMIT_LOCK_RE = /(^|\/)(package-lock\.json|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|flake\.lock|[^/]+\.lock)$/
+
+function graphFileLines(file) {
+  let n = 0
+
+  for (const hunk of (file && file.hunks) || []) n += ((hunk && hunk.lines) || []).length
+
+  return n
+}
+
+// Collapsed by default when the text carries no signal worth the scroll: binary,
+// a lockfile, or a file past 400 lines. Clicking the header still opens it.
+function graphFileCollapsed(file) {
+  if (!file) return true
+  if (file.binary) return true
+  if (GRAPH_COMMIT_LOCK_RE.test(String(file.path || ''))) return true
+
+  return graphFileLines(file) > 400
+}
+
+function graphCommitFailure(data, folder) {
+  const code = String((data && data.code) || '')
+
+  if (code === 'bad_sha') return { detail: '', text: 'Not a valid commit hash' }
+  if (code === 'not_found') return { detail: '', text: 'No such commit in this repository' }
+
+  return ghFailureText(data, folder)
+}
+
+function graphStatusTone(status) {
+  if (status === 'A') return 'var(--ui-diff-add-foreground)'
+  if (status === 'D') return 'var(--ui-diff-remove-foreground)'
+  if (status === 'R' || status === 'C') return 'var(--ui-accent)'
+  if (status === 'T') return 'var(--ui-orange)'
+
+  return 'var(--ui-text-secondary)'
+}
+
+function graphTruncatedText(detail) {
+  const reason = String((detail && detail.truncated_reason) || '')
+  const total = Number((detail && detail.stats && detail.stats.files) || 0) || 0
+  const shown = Array.isArray(detail && detail.files) ? detail.files.length : 0
+  const hidden = Math.max(0, total - shown)
+  const cut =
+    reason === 'bytes'
+      ? 'Diff cut at 512 KB.'
+      : reason === 'lines'
+        ? 'Diff cut at 6,000 lines.'
+        : reason === 'files'
+          ? `Only the first ${shown} files are shown.`
+          : 'Diff cut.'
+
+  return hidden > 0 ? `${cut} ${hidden} more ${hidden === 1 ? 'file' : 'files'} not shown.` : cut
+}
+
+function GitDiffFile({ file }) {
+  const [open, setOpen] = useState(() => !graphFileCollapsed(file))
+  const additions = Number(file.additions) || 0
+  const deletions = Number(file.deletions) || 0
+  const status = String(file.status || 'M').slice(0, 1) || 'M'
+  const renamed = file.old_path && file.old_path !== file.path
+  // Line numbers are derived here, per hunk, because the payload only carries
+  // the hunk starts. A "\ No newline" line belongs to neither side.
+  const hunks = (Array.isArray(file.hunks) ? file.hunks : []).map(hunk => {
+    let oldNo = Number(hunk.old_start) || 1
+    let newNo = Number(hunk.new_start) || 1
+    const rows = ((hunk && hunk.lines) || []).map(line => {
+      const op = line[0]
+      const text = String(line[1] == null ? '' : line[1])
+      let old = ''
+      let lineNew = ''
+
+      if (op === '+') {
+        lineNew = newNo
+        newNo += 1
+      } else if (op === '-') {
+        old = oldNo
+        oldNo += 1
+      } else if (op === ' ') {
+        old = oldNo
+        lineNew = newNo
+        oldNo += 1
+        newNo += 1
+      }
+
+      return { new: lineNew, old, op, text }
+    })
+
+    return { header: String((hunk && hunk.header) || ''), rows }
+  })
+
+  return jsxs('div', {
+    children: [
+      jsxs('button', {
+        className: 'pcc-gh-chip',
+        onClick: () => setOpen(value => !value),
+        style: S.diffFileHead,
+        title: open ? 'Collapse this file' : 'Expand this file',
+        type: 'button',
+        children: [
+          jsx(Codicon, {
+            name: open ? 'chevron-down' : 'chevron-right',
+            size: '0.75rem',
+            style: { flex: 'none', color: 'var(--ui-text-quaternary)' }
+          }),
+          jsx('span', { style: { ...S.diffStatus, color: graphStatusTone(status) }, children: status }),
+          renamed
+            ? jsxs('span', {
+                style: S.diffPath,
+                children: [
+                  jsx('span', { style: { color: 'var(--ui-text-quaternary)' }, children: String(file.old_path) }),
+                  ' → ',
+                  jsx('span', { children: String(file.path || '') })
+                ]
+              })
+            : jsx('span', { style: S.diffPath, title: String(file.path || ''), children: String(file.path || '') }),
+          file.binary ? jsx('span', { style: S.diffCount, children: 'binary' }) : null,
+          file.truncated && !file.binary ? jsx('span', { style: S.diffCount, children: 'cut' }) : null,
+          jsx('span', { style: { ...S.diffCount, color: 'var(--ui-diff-add-foreground)' }, children: `+${additions}` }),
+          jsx('span', { style: { ...S.diffCount, color: 'var(--ui-diff-remove-foreground)' }, children: `-${deletions}` })
+        ]
+      }),
+      open
+        ? jsx('div', {
+            style: S.diffBox,
+            children:
+              hunks.length === 0
+                ? jsx('div', { style: { ...S.graphNote, padding: '4px 8px' }, children: file.binary ? 'Binary file, no text diff' : 'No text diff in this payload' })
+                : jsx('div', {
+                    className: 'pcc-diff-scroll',
+                    style: S.diffScroll,
+                    children: hunks.map((hunk, h) =>
+                      jsxs(
+                        'div',
+                        {
+                          children: [
+                            jsx('div', { style: S.diffHunk, children: hunk.header }),
+                            hunk.rows.map((line, i) => {
+                              const tone =
+                                line.op === '+'
+                                  ? {
+                                      background: 'var(--ui-diff-add-background)',
+                                      borderLeft: '2px solid var(--ui-diff-add-border)',
+                                      color: 'var(--ui-diff-add-foreground)'
+                                    }
+                                  : line.op === '-'
+                                    ? {
+                                        background: 'var(--ui-diff-remove-background)',
+                                        borderLeft: '2px solid var(--ui-diff-remove-border)',
+                                        color: 'var(--ui-diff-remove-foreground)'
+                                      }
+                                    : line.op === '\\'
+                                      ? { borderLeft: '2px solid transparent', color: 'var(--ui-text-quaternary)' }
+                                      : { borderLeft: '2px solid transparent', color: 'var(--ui-text-secondary)' }
+
+                              return jsxs(
+                                'div',
+                                {
+                                  style: { ...S.diffLine, ...tone },
+                                  children: [
+                                    jsx('span', {
+                                      style: { ...S.diffNo, color: 'inherit', opacity: 0.7 },
+                                      children: line.old === '' ? '' : String(line.old)
+                                    }),
+                                    jsx('span', {
+                                      style: { ...S.diffNo, color: 'inherit', opacity: 0.7 },
+                                      children: line.new === '' ? '' : String(line.new)
+                                    }),
+                                    jsx('span', { style: S.diffText, children: line.text === '' ? ' ' : line.text })
+                                  ]
+                                },
+                                `${h}-${i}`
+                              )
+                            })
+                          ]
+                        },
+                        `hunk-${h}`
+                      )
+                    )
+                  })
+          })
+        : null
+    ]
+  })
+}
+
+function GitCommitBody({ detail, folder, onOpen }) {
+  const numbers = useMemo(() => ghRefNumbers([detail && detail.body]), [detail])
+  const refQuery = useQuery({
+    enabled: Boolean(folder) && numbers.length > 0,
+    queryKey: [QUERY_ROOT, 'github', 'refs', folder, numbers.join(',')],
+    queryFn: () =>
+      ghRest(`/github/refs?path=${encodeURIComponent(folder)}&numbers=${numbers.join(',')}`).catch(() => null),
+    retry: false,
+    staleTime: 60000
+  })
+  const refsData = refQuery.data
+  const refs = refsData && refsData.ok && refsData.refs ? refsData.refs : {}
+  const decorate = useCallback(children => ghDecorateRefs(children, refs, onOpen, folder), [refs, onOpen, folder])
+  const refKey = useMemo(() => Object.keys(refs).sort().join(','), [refs])
+  const files = Array.isArray(detail.files) ? detail.files : []
+  const stats = detail.stats || {}
+  const total = Number(stats.files) || files.length
+  const additions = Number(stats.additions) || 0
+  const deletions = Number(stats.deletions) || 0
+  const parents = Array.isArray(detail.parents) ? detail.parents : []
+
+  return jsxs('div', {
+    style: S.ghThread,
+    children: [
+      jsxs('div', {
+        style: S.ghSection,
+        children: [
+          ghHead('comment', 'Message'),
+          detail.body
+            ? jsx('div', {
+                key: `prose-${refKey || 'none'}`,
+                style: S.ghProse,
+                children: jsx(MessageTextContent, { decorateText: decorate, media: false, text: String(detail.body) })
+              })
+            : jsx('div', { style: S.ghQuiet, children: 'No message body.' })
+        ]
+      }),
+      parents.length > 1
+        ? jsx('div', { style: S.graphNote, children: 'Changes against the first parent.' })
+        : null,
+      jsxs('div', {
+        style: S.ghSection,
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+            children: [
+              ghHead('diff', 'Files changed', total),
+              jsx('span', { style: { flex: '1 1 0' } }),
+              jsxs('span', {
+                style: { ...S.diffCount, fontSize: '0.6875rem', color: 'var(--ui-text-quaternary)' },
+                children: [
+                  jsx('span', { style: { color: 'var(--ui-diff-add-foreground)' }, children: `+${additions}` }),
+                  ' ',
+                  jsx('span', { style: { color: 'var(--ui-diff-remove-foreground)' }, children: `-${deletions}` })
+                ]
+              })
+            ]
+          }),
+          files.length === 0
+            ? jsx('div', { style: S.ghQuiet, children: 'No changed files against the first parent.' })
+            : files.map((file, i) => jsx(GitDiffFile, { file }, `${file.path || 'file'}-${i}`)),
+          detail.truncated ? jsx('div', { style: S.graphNote, children: graphTruncatedText(detail) }) : null
+        ]
+      })
+    ]
+  })
+}
+
+function GitCommitModal({ depth, entry, folder, onBack, onClose, onOpen, onOpenCommit, owner, repo }) {
+  const sha = String(entry.sha || '')
+  const query = useQuery({
+    enabled: Boolean(folder) && Boolean(sha),
+    queryKey: [QUERY_ROOT, 'git', 'commit', folder, sha],
+    queryFn: () => ghRest(`/git/commit/${encodeURIComponent(sha)}?path=${encodeURIComponent(folder)}`),
+    retry: false,
+    staleTime: Infinity,
+    gcTime: 300000
+  })
+  const payload = query.data || null
+  const failed = payload && ((payload.code && payload.code !== 'ok') || payload.error) ? payload : null
+  const detail = payload && !failed ? payload : null
+  const failure = failed ? graphCommitFailure(failed, folder) : null
+  const author = (detail && detail.author) || {}
+  const committer = (detail && detail.committer) || null
+  const authorName = String(author.name || 'unknown')
+  const url = detail && detail.on_remote && owner && repo ? `https://github.com/${owner}/${repo}/commit/${detail.sha}` : ''
+  const canOpenExternal = Boolean(pluginCtx && pluginCtx.os && typeof pluginCtx.os.openExternal === 'function')
+  const copySha = () => {
+    if (!detail) return
+    Promise.resolve(writeClipboardText(detail.sha)).then(ok => {
+      host.notify(ok === false ? { kind: 'warning', message: 'Could not copy the commit hash.' } : { kind: 'success', message: 'Commit hash copied' })
+    })
+  }
+  const openExternal = () => {
+    if (!url || !canOpenExternal) return
+    Promise.resolve(pluginCtx.os.openExternal(url)).then(ok => {
+      if (ok === false) host.notify({ kind: 'warning', message: 'Could not open the browser.' })
+    })
+  }
+
+  return jsxs(Dialog, {
+    onOpenChange: next => {
+      if (!next) onClose()
+    },
+    open: true,
+    children: [
+      jsxs(DialogContent, {
+        style: { maxWidth: 'min(1100px, 94vw)' },
+        children: [
+          jsxs(DialogHeader, {
+            style: S.ghModalHead,
+            children: [
+              jsxs('div', {
+                style: S.ghModalTitleRow,
+                children: [
+                  depth > 1 && onBack
+                    ? jsx('button', {
+                        'aria-label': 'Back',
+                        className: 'pcc-gh-back',
+                        onClick: onBack,
+                        style: S.ghBackBtn,
+                        title: 'Back',
+                        type: 'button',
+                        children: jsx(Codicon, { name: 'chevron-left', size: '0.875rem' })
+                      })
+                    : jsx(Codicon, {
+                        name: 'git-commit',
+                        size: '0.875rem',
+                        style: { flex: 'none', color: 'var(--ui-text-secondary)', paddingTop: 2 }
+                      }),
+                  jsx('span', { style: S.ghModalNum, children: (detail && detail.short) || sha.slice(0, 7) }),
+                  jsx(DialogTitle, { style: S.ghModalTitle, children: (detail && detail.subject) || 'Commit' }),
+                  detail && (detail.parents || []).length > 1
+                    ? jsx(Badge, { size: 'xs', variant: 'muted', children: 'merge' })
+                    : null,
+                  detail
+                    ? jsxs('button', {
+                        className: 'pcc-gh-chip',
+                        onClick: copySha,
+                        style: S.ghChipBtn,
+                        title: 'Copy the full hash',
+                        type: 'button',
+                        children: ['Copy hash', jsx(Codicon, { name: 'copy', size: '0.6875rem' })]
+                      })
+                    : null,
+                  url && canOpenExternal
+                    ? jsxs('button', {
+                        className: 'pcc-gh-chip',
+                        onClick: openExternal,
+                        style: S.ghChipBtn,
+                        title: 'View on GitHub',
+                        type: 'button',
+                        children: ['View on GitHub', jsx(Codicon, { name: 'link-external', size: '0.6875rem' })]
+                      })
+                    : null
+                ]
+              }),
+              detail
+                ? jsxs('div', {
+                    style: S.ghModalMeta,
+                    children: [
+                      jsxs('span', {
+                        style: S.ghActorRow,
+                        title: `${authorName} <${author.email || ''}>`,
+                        children: [
+                          jsx(GhMiniAvatar, { login: authorName, size: 16 }),
+                          jsx('span', { style: S.ghActor, children: authorName })
+                        ]
+                      }),
+                      jsx('span', {
+                        style: S.ghTiny,
+                        title: ghWhen(detail.authored_at),
+                        children: `authored ${ageText(detail.authored_at)}`
+                      }),
+                      committer && committer.name !== author.name
+                        ? jsx('span', {
+                            style: S.ghTiny,
+                            title: `${committer.name} <${committer.email}> · ${ghWhen(detail.committed_at)}`,
+                            children: `committed by ${committer.name} ${ageText(detail.committed_at)}`
+                          })
+                        : null,
+                      (detail.parents || []).length > 0
+                        ? jsxs('span', {
+                            style: { display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', minWidth: 0 },
+                            children: [
+                              jsx('span', { style: S.ghTiny, children: (detail.parents || []).length === 1 ? 'parent' : 'parents' }),
+                              ...(detail.parents || []).map(parent =>
+                                jsx(
+                                  'button',
+                                  {
+                                    className: 'pcc-gh-chip',
+                                    onClick: () => onOpenCommit && onOpenCommit(String(parent)),
+                                    style: {
+                                      ...S.ghChipBtn,
+                                      fontFamily: 'var(--font-mono, ui-monospace, monospace)'
+                                    },
+                                    title: String(parent),
+                                    type: 'button',
+                                    children: String(parent).slice(0, 7)
+                                  },
+                                  String(parent)
+                                )
+                              )
+                            ]
+                          })
+                        : null,
+                      jsxs('span', {
+                        style: S.ghDiff,
+                        children: [
+                          jsx('span', { style: { color: 'var(--ui-diff-add-foreground)' }, children: `+${Number(detail.stats && detail.stats.additions) || 0}` }),
+                          jsx('span', { style: { color: 'var(--ui-diff-remove-foreground)' }, children: `-${Number(detail.stats && detail.stats.deletions) || 0}` }),
+                          jsx('span', { children: `in ${Number(detail.stats && detail.stats.files) || 0} files` })
+                        ]
+                      })
+                    ]
+                  })
+                : null
+            ]
+          }),
+          query.isLoading && !detail
+            ? jsxs('div', {
+                style: S.ghSection,
+                children: [
+                  jsx(Skeleton, { style: { height: 12, width: '82%' } }),
+                  jsx(Skeleton, { style: { height: 12, width: '64%' } }),
+                  jsx(Skeleton, { style: { height: 12, width: '48%' } })
+                ]
+              })
+            : null,
+          query.isError && !detail ? jsx('div', { style: S.ghQuiet, children: 'Could not load this commit.' }) : null,
+          failed
+            ? jsx('div', {
+                style: S.ghQuiet,
+                title: failure.detail || '',
+                children: failure.text
+              })
+            : null,
+          detail ? jsx(GitCommitBody, { detail, folder, onOpen }) : null
+        ]
+      })
+    ]
+  })
+}
+
 function GhPrRow({ pr, sessions, onIssue, onOpen, flash }) {
   const linked = pr.linked_issues || []
-  const look = ghPrLook(pr)
+  const look = ghStatusLook('pr', pr)
 
   return jsxs('div', {
     'data-pr': pr.number,
@@ -3035,7 +4732,7 @@ function GhPrRow({ pr, sessions, onIssue, onOpen, flash }) {
               })
             ]
           }),
-          jsx('span', { style: S.ghAge, children: ghAgo(pr.updated_at) })
+          jsx('span', { style: S.ghAge, title: ghWhen(pr.updated_at), children: ageText(pr.updated_at) })
         ]
       }),
       jsxs('div', {
@@ -3061,7 +4758,7 @@ function GhPrRow({ pr, sessions, onIssue, onOpen, flash }) {
 }
 
 function GhPrSubRow({ pr, sessions, onOpen }) {
-  const look = ghPrLook(pr)
+  const look = ghStatusLook('pr', pr)
 
   return jsxs('button', {
     className: 'pcc-gh-sub-btn',
@@ -3080,14 +4777,14 @@ function GhPrSubRow({ pr, sessions, onOpen }) {
   })
 }
 
-// ── a chat about an issue ────────────────────────────────────────────────────
+// ── a session about an issue ─────────────────────────────────────────────────
 // The GitHub read is the only surface that knows an issue's repo and number, so
-// a click here is the shortest path from "issue" to "a chat about it": the app
-// opens a fresh chat DRAFT, the issue lands in that composer as ordinary,
+// a click here is the shortest path from "issue" to "a session about it": the
+// app opens a fresh session DRAFT, the issue lands in that composer as ordinary,
 // editable text, and the caret sits on the blank line underneath it. This path
-// creates no session, sends no turn and writes no board link — there is no
-// stored id at click time, so the link row belongs to the hooks on the first
-// turn. Nothing is submitted: the user writes the question and presses Enter.
+// sends no turn and writes no board link — there is no stored id at click time,
+// so the link row belongs to the hooks on the first turn. Nothing is submitted:
+// the user writes the question and presses Enter.
 
 function issueUrl(owner, repo, number) {
   if (!owner || !repo) return ''
@@ -3116,7 +4813,7 @@ function issueDraftText({ labels, number, owner, repo, state, title, url }) {
 
 // The app's own "new chat" door: a fresh draft in this profile with no session
 // id yet. `host.newChat` is the documented verb; the `session.new` app action is
-// the fallback for a build that predates it.
+// the fallback for a build that predates it. Used only when a folder is missing.
 function openNewChat() {
   const profile = profileParam().profile || null
 
@@ -3129,10 +4826,10 @@ function openNewChat() {
   if (pluginCtx && typeof pluginCtx.runAction === 'function') pluginCtx.runAction('session.new')
 }
 
-// Write the issue into the fresh chat's composer. `'new'` is the draft that has
-// no session id yet, answered only by the primary pane while it shows no
+// Write the issue into the fresh session's composer. `'new'` is the draft that
+// has no session id yet, answered only by the primary pane while it shows no
 // session; `null` is the composer the user is typing in. Both fail closed until
-// the new chat has painted, so the write runs on a bounded retry schedule and
+// the new session has painted, so the write runs on a bounded retry schedule and
 // the first address that answers true wins. submit() is never called: the text
 // is the user's to edit.
 function seedDraftText(text) {
@@ -3185,24 +4882,185 @@ function seedDraftText(text) {
   })
 }
 
-// The anchored chat is already showing, so `'new'` (which only answers while the primary
-// shows NO session) resolves false. Focus the live composer first, then write through the
-// retrying helper, which tries `'new'` and falls back to `null` on false as well as throw.
-function placeDraftInOpenChat(text) {
-  try {
-    if (host.composer && typeof host.composer.focus === 'function') host.composer.focus(null)
-  } catch (err) {
-    // Focus is cosmetic; the write below is what matters.
+// Write text into a composer addressed by session id. `openSession` returns
+// before the tab has painted its composer, and setDraft fails closed on an
+// address no surface answers yet, so the write runs on the bounded retry
+// schedule. submit() is never called: the text is the user's to edit.
+function seedSessionDraft(sessionId, text) {
+  if (!pluginCtx || !host.composer || typeof host.composer.setDraft !== 'function') return Promise.resolve(false)
+
+  return new Promise(resolve => {
+    let attempt = 0
+
+    const run = () => {
+      if (pluginDisposed) {
+        resolve(false)
+
+        return
+      }
+
+      Promise.resolve(host.composer.setDraft(sessionId, text))
+        .catch(() => false)
+        .then(ok => {
+          if (ok) {
+            if (typeof host.composer.focus === 'function') host.composer.focus(sessionId)
+            resolve(true)
+
+            return
+          }
+
+          if (attempt >= DRAFT_RETRY_MS.length) {
+            resolve(false)
+
+            return
+          }
+
+          if (!schedule(run, DRAFT_RETRY_MS[attempt])) {
+            resolve(false)
+
+            return
+          }
+
+          attempt += 1
+        })
+    }
+
+    run()
+  })
+}
+
+// The stock session door: one session.create with an explicit cwd, the app's
+// own tab for the returned stored id, then the draft in that session's
+// composer. This is the same request core's startSessionInWorkspace makes, so
+// it works on a stock Desktop with no SDK patch and no extra install step.
+function openSessionInFolder(folder, text) {
+  const path = String(folder || '').trim()
+
+  if (!path) return Promise.reject(new Error('No folder to open a session in.'))
+  if (!host || typeof host.request !== 'function' || typeof host.openSession !== 'function') {
+    return Promise.reject(new Error('This Desktop build cannot open a session in a folder.'))
   }
 
-  const read =
-    host.composer && typeof host.composer.getDraft === 'function'
-      ? Promise.resolve(host.composer.getDraft(null)).catch(() => null)
-      : Promise.resolve(null)
+  let id = ''
 
-  return read
-    .then(current => (current != null && String(current).trim() ? true : seedDraftText(text)))
-    .catch(() => seedDraftText(text))
+  // A session minted over `host.request` rides the ambient gateway, so it carries
+  // no owner stamp, and openSession refuses to guess which backend holds it
+  // ("Session owner could not be resolved"). Handing the active connection and
+  // profile over as an explicit owner route is the exact hint that resolution
+  // needs; without it the tab lands on an error screen.
+  const ownerRoute = () => {
+    let connectionId = ''
+    let profile = ''
+
+    try {
+      connectionId = String((host.state && host.state.connectionId && host.state.connectionId.get()) || '')
+    } catch {
+      connectionId = ''
+    }
+
+    try {
+      profile = String((host.state && host.state.profile && host.state.profile.get()) || '')
+    } catch {
+      profile = ''
+    }
+
+    return connectionId ? { connectionId, profile: profile || 'default' } : null
+  }
+
+  return Promise.resolve(
+    host.request('session.create', { cwd: path, source: 'gui', cols: 96, cwd_explicit: true, ...profileParam() })
+  )
+    .then(res => {
+      id = String((res && res.stored_session_id) || '').trim()
+      if (!id) throw new Error('The new session came back without an id.')
+
+      const route = ownerRoute()
+      const options = { intent: 'tab' }
+
+      if (route) options.route = route
+
+      return host.openSession(id, options)
+    })
+    .then(() => seedSessionDraft(id, text))
+    .catch(err => {
+      // A created session whose tab or draft failed must not open a second one,
+      // and there is no second door to try: this is the only session path the
+      // plugin has, and it needs no local Desktop patch.
+      throw err
+    })
+}
+
+// Where a session lands, named the way the user reads it: owner/repo when the
+// remote said so, else the folder's own name.
+function shortRepoName(owner, name, folder) {
+  if (owner && name) return `${owner}/${name}`
+  const parts = String(folder || '').split('/').filter(Boolean)
+
+  return parts.length ? parts[parts.length - 1] : ''
+}
+
+// One small header and one instruction. The agent reads the branch and the PR
+// with its own tools, so nothing here summarizes them.
+function branchSessionDraft({ branch, folder, owner, pr, repo, where }) {
+  const lines = [`Branch: ${branch}`]
+  const repoText = shortRepoName(owner, repo, folder)
+
+  if (repoText) lines.push(`Repo: ${repoText}`)
+  if (pr && Number(pr.number)) {
+    const title = String(pr.title || '').trim().slice(0, 100)
+    lines.push(`PR: #${Number(pr.number)}${title ? ` ${title}` : ''}`)
+  }
+
+  return `${lines.join('\n')}\n\n${where}\n\n`
+}
+
+// The project header's door: the primary folder, the branch it is on right now,
+// and one line of context. It never moves the checkout.
+function continueSessionDraft({ branch, folder, owner, repo }) {
+  const repoText = shortRepoName(owner, repo, folder)
+  const where = [repoText, branch ? `on ${branch}` : ''].filter(Boolean).join(' ')
+
+  return `Continue where we left off${where ? ` in ${where}` : ''}.\n\n`
+}
+
+// The Desktop bridge that owns git. Worktree creation is core's own flow, not
+// a reimplementation: `worktreeAdd` locally, the backend mirror for a remote
+// gateway, the same two doors the sidebar uses.
+function desktopBridge() {
+  return typeof window !== 'undefined' && window.hermesDesktop ? window.hermesDesktop : null
+}
+
+// `null` means "this build cannot list worktrees", which is different from an
+// empty list: only an empty list means no worktree exists for the branch.
+function listWorktrees(folder) {
+  const desktop = desktopBridge()
+
+  if (desktop && desktop.git && typeof desktop.git.worktreeList === 'function') {
+    return Promise.resolve(desktop.git.worktreeList(folder)).then(rows => (Array.isArray(rows) ? rows : []))
+  }
+
+  if (desktop && typeof desktop.api === 'function') {
+    return Promise.resolve(desktop.api({ path: `/api/git/worktrees?path=${encodeURIComponent(folder)}`, method: 'GET' }))
+      .then(res => (res && Array.isArray(res.worktrees) ? res.worktrees : []))
+  }
+
+  return Promise.resolve(null)
+}
+
+function createWorktree(folder, options) {
+  const desktop = desktopBridge()
+
+  if (desktop && desktop.git && typeof desktop.git.worktreeAdd === 'function') {
+    return Promise.resolve(desktop.git.worktreeAdd(folder, options))
+  }
+
+  if (desktop && typeof desktop.api === 'function') {
+    return Promise.resolve(
+      desktop.api({ path: '/api/git/worktree/add', method: 'POST', body: { path: folder, ...options } })
+    )
+  }
+
+  return Promise.reject(new Error('This Desktop build cannot create worktrees.'))
 }
 
 function openIssueDraft({ folder, issue, owner, repo }) {
@@ -3216,21 +5074,11 @@ function openIssueDraft({ folder, issue, owner, repo }) {
     url: issue.html_url
   })
 
-  // The anchored door: the same call the sidebar's project "+" makes, so the
-  // new chat's cwd is this project's folder and the text is already in its
-  // composer. Feature-detected, because it is a newer SDK method.
-  if (folder && host && typeof host.newChatInWorkspace === 'function') {
-    if (host.newChatInWorkspace(folder, text)) {
-      schedule(() => {
-        placeDraftInOpenChat(text).catch(() => false)
-      }, 400)
+  // The anchored door: a session whose cwd is this project's folder, with the
+  // text already in its composer. No folder means the board has no anchor to
+  // offer, so the detached draft is the only honest door left.
+  if (folder) return openSessionInFolder(folder, text)
 
-      return Promise.resolve(true)
-    }
-  }
-
-  // Older shell: a detached draft, still with the text, but the cwd is the
-  // app's workspace rather than this project.
   openNewChat()
 
   return seedDraftText(text)
@@ -3247,29 +5095,62 @@ function StartSessionButton({ folder, issue, owner, repo }) {
     setBusy(true)
     openIssueDraft({ folder, issue, owner, repo })
       .then(ok => {
-        // The chat is open either way; one quiet note only when the text never
-        // reached the composer, so the click is never a silent no-op.
-        if (!ok) host.notify({ kind: 'info', message: 'New chat opened, but the issue text did not reach the composer.' })
+        // The session is open either way; one quiet note only when the text
+        // never reached the composer, so the click is never a silent no-op.
+        if (!ok) host.notify({ kind: 'info', message: 'New session opened, but the issue text did not reach the composer.' })
       })
       .catch(err =>
         host.notify({
           kind: 'error',
-          message: `Could not open a chat: ${err && err.message ? err.message : err}`
+          message: `Could not open a session: ${err && err.message ? err.message : err}`
         })
       )
       .then(() => setBusy(false))
   }
 
   return jsxs(Button, {
-    'aria-label': `Start a new chat about issue ${issue.number}`,
+    'aria-label': `Start a new session about issue ${issue.number}`,
     disabled: busy,
     onClick: start,
     size: 'xs',
-    title: 'Open a new chat with this issue in the composer',
+    title: 'Open a new session with this issue in the composer',
     variant: 'outline',
     children: [
       jsx(Codicon, { name: busy ? 'loading' : 'comment-discussion', size: '0.75rem', spinning: busy }),
-      busy ? 'Opening' : 'New chat'
+      busy ? 'Opening' : 'New session'
+    ]
+  })
+}
+
+function NewSessionButton({ branch, folder, owner, repo }) {
+  const [busy, setBusy] = useState(false)
+  const draft = continueSessionDraft({ branch, folder, owner, repo })
+  const start = () => {
+    if (busy || !folder) return
+    setBusy(true)
+    openSessionInFolder(folder, draft)
+      .then(ok => {
+        if (!ok) host.notify({ kind: 'info', message: 'The session opened, but the draft did not reach the composer.' })
+      })
+      .catch(err =>
+        host.notify({
+          kind: 'error',
+          message: `Could not open a session: ${err && err.message ? err.message : err}`
+        })
+      )
+      .then(() => setBusy(false))
+  }
+
+  return jsxs(Button, {
+    'aria-label': folder ? 'New session in this project folder' : 'New session unavailable',
+    disabled: busy || !folder,
+    onClick: start,
+    size: 'xs',
+    title: folder ? `New session in ${folder}` : 'No folder to start a session in.',
+    variant: 'outline',
+    children: [
+      jsx(Codicon, { name: busy ? 'loading' : 'add', size: '0.75rem', spinning: busy }),
+      busy ? 'Opening' : 'New session'
     ]
   })
 }
@@ -3279,6 +5160,7 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, fl
   const shownLabels = labels.slice(0, 3)
   const restLabels = labels.length - shownLabels.length
   const assignees = issue.assignees || []
+  const look = ghStatusLook('issue', issue)
 
   return jsxs('div', {
     'data-issue': issue.number,
@@ -3296,9 +5178,9 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, fl
             type: 'button',
             children: [
               jsx(Codicon, {
-                name: 'issues',
+                name: look.name,
                 size: '0.875rem',
-                style: { color: 'var(--ui-text-secondary)', flex: 'none', paddingTop: 2 }
+                style: { color: look.color, flex: 'none', paddingTop: 2 }
               }),
               jsx('span', { style: S.ghNum, children: ghNumber(issue.number) }),
               jsx('span', { style: S.ghTitle, children: issue.title || 'Untitled issue' }),
@@ -3309,7 +5191,7 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, fl
               })
             ]
           }),
-          jsx('span', { style: S.ghAge, children: ghAgo(issue.updated_at) })
+          jsx('span', { style: S.ghAge, title: ghWhen(issue.updated_at), children: ageText(issue.updated_at) })
         ]
       }),
       jsxs('div', {
@@ -3320,7 +5202,14 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, fl
           assignees.length > 0
             ? jsx(Tip, {
                 label: assignees.join(', '),
-                children: jsx('span', { style: S.ghInitials, children: ghInitials(assignees[0]) })
+                children: jsx('span', {
+                  style: { display: 'inline-flex' },
+                  children: jsx(GhMiniAvatar, {
+                    fallback: 'initials',
+                    login: assignees[0],
+                    src: (issue.assignee_avatars && issue.assignee_avatars[assignees[0]]) || ''
+                  })
+                })
               })
             : null,
           issue.comments
@@ -3356,10 +5245,11 @@ function GhIssueRow({ folder, issue, prs, sessionsByBranch, onOpen, onOpenPr, fl
   })
 }
 
-function GhBranchRow({ row, onOpenPr, onIssue }) {
+function GhBranchRow({ row, currentBranch, onOpenPr, onIssue, onOpenWorktree, onSessionWorktree, onSwitch, onCheckout, onOpenSessionHere }) {
   const local = row.local
   const pr = row.pr
   const running = row.sessions && row.sessions.live > 0
+  const current = Boolean(currentBranch) && row.name === currentBranch
 
   return jsxs('div', {
     className: 'pcc-gh-row',
@@ -3377,10 +5267,86 @@ function GhBranchRow({ row, onOpenPr, onIssue }) {
                 size: '0.875rem',
                 style: { flex: 'none', color: running ? 'var(--ui-accent)' : 'var(--ui-text-secondary)' }
               }),
-              jsx('span', { style: S.ghBranchName, title: row.name, children: row.name })
+              jsx('span', { style: S.ghBranchName, title: row.name, children: row.name }),
+              current
+                ? jsxs('span', {
+                    style: S.ghCurrent,
+                    title: 'The main folder is on this branch',
+                    children: [jsx('span', { 'aria-hidden': 'true', style: S.ghCurrentDot }), 'current']
+                  })
+                : null
             ]
           }),
-          jsx(GhSessions, { row: row.sessions })
+          jsx(GhSessions, { row: row.sessions }),
+          // A session door next to the ellipsis: both menus overlap on purpose.
+          // The ellipsis stays git actions; this one only ever opens a session.
+          jsxs(DropdownMenu, {
+            children: [
+              jsx(DropdownMenuTrigger, {
+                asChild: true,
+                children: jsx(Button, {
+                  'aria-label': `New session for ${row.name}`,
+                  className: 'pcc-branch-session',
+                  size: 'xs',
+                  style: S.ghSessionBtn,
+                  title: current
+                    ? `Open a session in the main folder, which is already on ${row.name}`
+                    : `Open a session for ${row.name}`,
+                  variant: 'ghost',
+                  children: [
+                    jsx(Codicon, { name: 'add', size: '0.75rem' }),
+                    'New session',
+                    jsx(Codicon, { name: 'chevron-down', size: '0.625rem' })
+                  ]
+                })
+              }),
+              jsx(DropdownMenuContent, {
+                align: 'end',
+                children: current
+                  ? jsx(DropdownMenuItem, {
+                      onSelect: () => onOpenSessionHere(row),
+                      children: [jsx(Codicon, { name: 'comment-discussion', size: '0.75rem' }), 'Open session on this branch']
+                    })
+                  : [
+                      jsxs(DropdownMenuItem, {
+                        onSelect: () => onSessionWorktree(row),
+                        children: [jsx(Codicon, { name: 'git-branch', size: '0.75rem' }), 'Open session in a worktree']
+                      }),
+                      jsxs(DropdownMenuItem, {
+                        onSelect: () => onCheckout(row),
+                        children: [jsx(Codicon, { name: 'arrow-swap', size: '0.75rem' }), 'Check out here and open a session']
+                      })
+                    ]
+              })
+            ]
+          }),
+          jsxs(DropdownMenu, {
+            children: [
+              jsx(DropdownMenuTrigger, {
+                asChild: true,
+                children: jsx(Button, {
+                  'aria-label': `Branch actions for ${row.name}`,
+                  className: 'pcc-branch-menu',
+                  size: 'icon-xs',
+                  variant: 'ghost',
+                  children: jsx(Codicon, { name: 'ellipsis', size: '0.75rem' })
+                })
+              }),
+              jsx(DropdownMenuContent, {
+                align: 'end',
+                children: [
+                  jsxs(DropdownMenuItem, {
+                    onSelect: () => onOpenWorktree(row),
+                    children: [jsx(Codicon, { name: 'git-branch', size: '0.75rem' }), 'Open worktree']
+                  }),
+                  jsxs(DropdownMenuItem, {
+                    onSelect: () => onSwitch(row),
+                    children: [jsx(Codicon, { name: 'arrow-swap', size: '0.75rem' }), 'Switch branch on the main folder']
+                  })
+                ]
+              })
+            ]
+          })
         ]
       }),
       jsxs('div', {
@@ -3401,58 +5367,554 @@ function GhBranchRow({ row, onOpenPr, onIssue }) {
             : jsx('span', { style: S.ghTiny, children: 'no PR' }),
           pr && (pr.linked_issues || []).length > 0 ? jsx(GhIssueChips, { numbers: pr.linked_issues, onIssue }) : null,
           local && local.subject ? jsx('span', { style: S.ghSubject, title: local.subject, children: local.subject }) : null,
-          local && local.last_commit_at ? jsx('span', { style: S.ghAge, children: ghAgo(local.last_commit_at) }) : null
+          local && local.last_commit_at ? jsx('span', { style: S.ghAge, title: ghWhen(local.last_commit_at), children: ageText(local.last_commit_at) }) : null
         ]
       })
     ]
   })
 }
 
-function GhShippedRow({ pr, onOpen }) {
-  const linked = pr.linked_issues || []
+const GRAPH_WINDOW_LIMIT = 200
+const GRAPH_WIDE_MIN = 760
+const GRAPH_LABEL_GUTTER = 148
+
+function graphRefRank(ref) {
+  const kind = ref.kind || (ref.is_remote ? 'remote' : ref.is_head ? 'local' : 'local')
+
+  if (kind === 'local') return ref.is_head ? 0 : 1
+  if (kind === 'remote') return 2
+
+  return 3
+}
+
+function graphSortRefs(list) {
+  return [...list].sort(
+    (a, b) => graphRefRank(a) - graphRefRank(b) || String(a.short || '').localeCompare(String(b.short || ''))
+  )
+}
+
+// A local branch and the remote it tracks on the same sha are one fact, so the
+// remote pill folds into the local one (which carries the cloud mark).
+function graphVisibleRefs(list) {
+  const tracked = new Set(
+    list.filter(ref => ref.kind === 'local' && ref.upstream).map(ref => String(ref.upstream))
+  )
+
+  return list.filter(ref => !(ref.kind === 'remote' && tracked.has(String(ref.short || ''))))
+}
+
+function GraphRefPill({ color, compact, ref }) {
+  const kind = ref.kind || (ref.is_remote ? 'remote' : 'local')
+  const ahead = Number(ref.ahead) || 0
+  const behind = Number(ref.behind) || 0
+  const upstream = String(ref.upstream || '')
+  const icon = kind === 'tag' ? 'tag' : kind === 'remote' ? 'cloud' : ref.is_head ? 'check' : 'git-branch'
+  const title = [`${kind} ref ${ref.short || ''}`]
+
+  if (upstream) title.push(`tracks ${upstream}`)
+  if (ahead) title.push(`${ahead} ahead`)
+  if (behind) title.push(`${behind} behind`)
+  if (ref.gone) title.push('upstream gone')
+  if (ref.is_head) title.push('HEAD')
+
+  return jsxs('span', {
+    style: {
+      ...S.graphPill,
+      maxWidth: compact ? 112 : 140,
+      color: kind === 'tag' || kind === 'remote' ? 'var(--ui-text-tertiary)' : 'var(--ui-text-secondary)',
+      borderColor: `color-mix(in srgb, ${color} 55%, transparent)`
+    },
+    title: title.join(', '),
+    children: [
+      jsx(Codicon, { name: icon, size: '0.625rem', style: { flex: 'none' } }),
+      jsx('span', { style: S.graphPillText, children: String(ref.short || '') }),
+      ahead > 0
+        ? jsx('span', {
+            style: { ...S.graphBadge, color: 'var(--ui-diff-add-foreground)' },
+            title: `${ahead} ${ahead === 1 ? 'commit' : 'commits'} ahead of ${upstream || 'upstream'}`,
+            children: `↑${ahead}`
+          })
+        : null,
+      behind > 0
+        ? jsx('span', {
+            style: { ...S.graphBadge, color: 'var(--ui-diff-remove-foreground)' },
+            title: `${behind} ${behind === 1 ? 'commit' : 'commits'} behind ${upstream || 'upstream'}`,
+            children: `↓${behind}`
+          })
+        : null,
+      ref.gone ? jsx('span', { style: { ...S.graphBadge, color: 'var(--ui-text-quaternary)' }, children: 'gone' }) : null,
+      kind === 'local' && upstream && !ref.is_remote
+        ? jsx(Codicon, { name: 'cloud', size: '0.5625rem', style: { flex: 'none', opacity: 0.7 } })
+        : null
+    ]
+  })
+}
+
+function GitGraphView({ data, error, folder, loading, onOpenCommit }) {
+  const boxRef = useRef(null)
+  const [wide, setWide] = useState(true)
+  const commits = data && Array.isArray(data.commits) ? data.commits : []
+  const refs = data && Array.isArray(data.refs) ? data.refs : []
+
+  useEffect(() => {
+    const el = boxRef.current
+
+    if (!el || typeof ResizeObserver === 'undefined') return undefined
+    const ro = new ResizeObserver(entries => {
+      const width = entries[0] && entries[0].contentRect ? entries[0].contentRect.width : 0
+      setWide(width >= GRAPH_WIDE_MIN)
+    })
+    ro.observe(el)
+
+    return () => ro.disconnect()
+  }, [])
+
+  // Layout memoizes on the payload object, which the query replaces only when
+  // the fingerprint or the window changed. One pass per fetch, never per render.
+  const layout = useMemo(() => {
+    if (!commits.length) return null
+    try {
+      return pccGraphLayout({
+        commits,
+        default_branch: (data && data.default_branch) || null,
+        head: (data && data.head) || null,
+        refs
+      })
+    } catch {
+      return null
+    }
+  }, [data])
+
+  const gutter = wide ? GRAPH_LABEL_GUTTER : 0
+  const paths = useMemo(() => {
+    if (!layout) return null
+    try {
+      return pccGraphPaths(layout, { labelGutter: gutter, maxLanes: layout.maxLanes })
+    } catch {
+      return null
+    }
+  }, [layout, gutter])
+
+  const refsBySha = useMemo(() => {
+    const map = new Map()
+
+    for (const ref of refs) {
+      const sha = String(ref.sha || '')
+      if (!sha) continue
+      const list = map.get(sha) || []
+      list.push(ref)
+      map.set(sha, list)
+    }
+    for (const [sha, list] of map) map.set(sha, graphSortRefs(list))
+
+    return map
+  }, [data])
+
+  const graphWidth = paths ? paths.width : gutter + 8 + GRAPH_LANE_W * 4
+  const laneWidth = graphWidth - gutter
+  const failed = data && ((data.code && data.code !== 'ok') || data.error) ? data : null
+  const drawn = Boolean(paths) && Boolean(layout) && layout.anomalies === 0
+
+  if (error) {
+    const message = String((error && error.message) || error)
+    const unloaded = /404|no route|not found|not available/i.test(message)
+
+    return jsx('div', {
+      style: S.ghQuiet,
+      children: unloaded
+        ? 'The graph needs the updated backend. Restart hermes-serve to load it.'
+        : 'Could not read the git history for this folder.'
+    })
+  }
+
+  if (loading) {
+    return jsxs('div', {
+      style: { ...S.ghSection, paddingTop: 10 },
+      children: [
+        jsx(Skeleton, { style: { height: 12, width: '82%' } }),
+        jsx(Skeleton, { style: { height: 12, width: '64%' } }),
+        jsx(Skeleton, { style: { height: 12, width: '48%' } })
+      ]
+    })
+  }
+
+  if (failed) return jsx(GhFailure, { data: failed, folder })
+  if (commits.length === 0) return jsx('div', { style: S.ghQuiet, children: 'No commits yet' })
+
+  const rowRefs = commit => {
+    const list = graphVisibleRefs(refsBySha.get(String(commit.sha || '')) || [])
+
+    if (list.length === 0 && commit.is_head && data && data.head && data.head.detached) {
+      return [{ kind: 'local', short: 'HEAD', is_head: true }]
+    }
+
+    return list
+  }
+
+  const pills = (list, shown, color) => {
+    const visible = list.slice(0, shown)
+    const hidden = list.length - visible.length
+
+    return visible
+      .map((ref, i) => jsx(GraphRefPill, { color, compact: shown === 1 && list.length > 1, ref }, `${ref.name || ref.short}-${i}`))
+      .concat(
+        hidden > 0
+          ? [
+              jsx(
+                Tip,
+                {
+                  label: list
+                    .slice(shown)
+                    .map(ref => String(ref.short || ''))
+                    .join(', '),
+                  children: jsx('span', { style: { ...S.graphBadge, color: 'var(--ui-text-quaternary)' }, children: `+${hidden}` })
+                },
+                `more-${shown}`
+              )
+            ]
+          : []
+      )
+  }
 
   return jsxs('div', {
-    'data-pr': pr.number,
-    className: 'pcc-gh-row',
-    style: S.ghRow,
+    ref: boxRef,
+    style: S.graphWrap,
     children: [
       jsxs('div', {
-        style: S.ghLine,
+        className: 'pcc-graph-scroll',
+        style: S.graphScroll,
         children: [
-          jsxs('button', {
-            className: 'pcc-gh-title',
-            onClick: onOpen,
-            style: S.ghTitleBtn,
-            title: 'Open the pull request thread',
-            type: 'button',
+          jsxs('div', {
+            style: S.graphHeader,
             children: [
-              jsx(Codicon, {
-                name: 'git-merge',
-                size: '0.875rem',
-                style: { color: 'var(--ui-accent)', flex: 'none', paddingTop: 2 }
-              }),
-              jsx('span', { style: S.ghNum, children: ghNumber(pr.number) }),
-              jsx('span', { style: { ...S.ghTitle, WebkitLineClamp: 1 }, children: pr.title || 'Untitled pull request' })
+              jsx('span', { style: { ...S.graphHeadCell, width: graphWidth }, children: 'Graph' }),
+              jsx('span', { style: { ...S.graphHeadCell, flex: '1 1 0' }, children: 'Description' }),
+              jsx('span', { style: { ...S.graphHeadCell, width: 86, textAlign: 'right' }, children: 'Date' }),
+              wide ? jsx('span', { style: { ...S.graphHeadCell, width: 120 }, children: 'Author' }) : null,
+              jsx('span', { style: { ...S.graphHeadCell, width: 62, textAlign: 'right' }, children: 'Commit' })
             ]
           }),
-          linked.length > 0 ? jsx(GhIssueChips, { numbers: linked }) : null,
-          jsx('span', { style: S.ghAge, children: ghAgo(pr.updated_at) })
+          jsxs('div', {
+            style: S.graphRows,
+            children: [
+              drawn
+                ? jsxs('svg', {
+                    'aria-hidden': true,
+                    style: {
+                      position: 'absolute',
+                      left: 0,
+                      top: 0,
+                      width: graphWidth,
+                      height: paths.height,
+                      pointerEvents: 'none',
+                      overflow: 'visible'
+                    },
+                    children: [
+                      paths.leaders
+                        ? jsx('path', {
+                            d: paths.leaders,
+                            fill: 'none',
+                            stroke: 'var(--ui-text-quaternary)',
+                            strokeDasharray: '2 3',
+                            strokeWidth: 1,
+                            style: { stroke: 'var(--ui-text-quaternary)' }
+                          })
+                        : null,
+                      ...Object.entries(paths.byColor).map(([color, d]) =>
+                        jsx(
+                          'path',
+                          {
+                            d,
+                            fill: 'none',
+                            strokeLinecap: 'round',
+                            strokeWidth: GRAPH_STROKE,
+                            style: { stroke: GRAPH_LANE_COLORS[Number(color)] || 'var(--ui-text-tertiary)' }
+                          },
+                          `edge-${color}`
+                        )
+                      ),
+                      ...Object.entries(paths.dotsByColor).map(([color, d]) =>
+                        jsx(
+                          'path',
+                          {
+                            d,
+                            stroke: 'var(--ui-surface-background, var(--ui-bg-editor))',
+                            strokeWidth: 1.5,
+                            style: { fill: GRAPH_LANE_COLORS[Number(color)] || 'var(--ui-text-tertiary)' }
+                          },
+                          `dot-${color}`
+                        )
+                      ),
+                      paths.clippedDots
+                        ? jsx('path', {
+                            d: paths.clippedDots,
+                            fill: 'var(--ui-bg-editor)',
+                            stroke: 'var(--ui-text-quaternary)',
+                            strokeWidth: 1
+                          })
+                        : null,
+                      paths.headRing
+                        ? jsx('path', {
+                            d: paths.headRing,
+                            fill: 'none',
+                            strokeWidth: 1,
+                            style: { stroke: 'var(--ui-accent)' }
+                          })
+                        : null
+                    ]
+                  })
+                : null,
+              commits.map((commit, i) => {
+                const row = layout && layout.rows[i] ? layout.rows[i] : null
+                const list = rowRefs(commit)
+                const short = String(commit.short || commit.sha || '').slice(0, 7)
+                const color = row ? GRAPH_LANE_COLORS[row.color] || 'var(--ui-text-tertiary)' : 'var(--ui-text-tertiary)'
+
+                return jsxs(
+                  'button',
+                  {
+                    'aria-label': `Open commit ${short}`,
+                    className: 'pcc-graph-row',
+                    onClick: () => onOpenCommit(commit.sha),
+                    style: S.graphRowShape,
+                    type: 'button',
+                    children: [
+                      wide
+                        ? jsx('span', {
+                            style: { ...S.graphGutter, width: gutter },
+                            children: pills(list, 1, color)
+                          })
+                        : null,
+                      jsx('span', { style: { ...S.graphLanes, width: laneWidth } }),
+                      !wide && list.length
+                        ? jsxs('span', {
+                            style: { display: 'flex', alignItems: 'center', gap: 3, flex: 'none', maxWidth: '45%', overflow: 'hidden' },
+                            children: pills(list, 2, color)
+                          })
+                        : null,
+                      jsx('span', {
+                        style: { ...S.graphSubject, fontWeight: commit.is_head ? 500 : 400 },
+                        title: commit.subject || '',
+                        children: commit.subject || ''
+                      }),
+                      jsx('span', {
+                        style: S.graphDate,
+                        title: ghWhen(commit.authored_at),
+                        children: ageText(commit.authored_at)
+                      }),
+                      wide
+                        ? jsxs('span', {
+                            style: S.graphAuthor,
+                            title: `${(commit.author && commit.author.name) || ''} <${(commit.author && commit.author.email) || ''}>`,
+                            children: [
+                              jsx(GhMiniAvatar, {
+                                login: String((commit.author && commit.author.name) || 'unknown'),
+                                size: 16
+                              }),
+                              jsx('span', { style: S.graphAuthorName, children: String((commit.author && commit.author.name) || '') })
+                            ]
+                          })
+                        : jsx('span', {
+                            style: { ...S.graphAuthor, width: 26 },
+                            title: `${(commit.author && commit.author.name) || ''} <${(commit.author && commit.author.email) || ''}>`,
+                            children: jsx(GhMiniAvatar, {
+                              login: String((commit.author && commit.author.name) || 'unknown'),
+                              size: 16
+                            })
+                          }),
+                      jsx('span', { style: S.graphHash, title: commit.sha, children: short })
+                    ]
+                  },
+                  commit.sha
+                )
+              })
+            ]
+          })
         ]
-      })
+      }),
+      layout && layout.anomalies > 0
+        ? jsx('div', {
+            style: S.graphNote,
+            children: `Graph could not be drawn for this history (${layout.anomalies} ${layout.anomalies === 1 ? 'join' : 'joins'} out of order).`
+          })
+        : null,
+      !drawn && (!layout || layout.anomalies === 0)
+        ? jsx('div', { style: S.graphNote, children: 'Graph could not be drawn for this history.' })
+        : null
     ]
   })
 }
 
-function GithubSection({ folder, projectId, sessionsByBranch }) {
+// The worktree step shared by both menus: the git action stops at a created
+// checkout, the session door carries on into a new session there. A prefilled
+// name and base are enough, since worktrees are core's `git worktree add -b`
+// under `<repo>/.worktrees/`, not something this plugin reimplements. An
+// existing branch is checked out as it is; a branch the clone does not have
+// starts from the base shown here.
+function WorktreeDialog({ folder, row, onClose, onCreated }) {
+  const exists = Boolean(row.local)
+  const [name, setName] = useState(row.name)
+  // A branch the clone does not have locally still exists on the remote, so the
+  // base must name that remote ref. Prefilling the repository name made git
+  // answer "invalid reference" for every PR-only branch.
+  const [base, setBase] = useState(exists ? row.name : `origin/${row.name}`)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const submit = () => {
+    const clean = name.trim()
+
+    if (busy || !clean) return
+    setBusy(true)
+    setError('')
+
+    const options = { base: base.trim() || undefined, branch: clean, name: clean }
+
+    createWorktree(folder, options)
+      .then(res => {
+        const target = String((res && res.path) || '')
+        if (!target) throw new Error('git did not return a worktree path.')
+
+        return onCreated(target, res)
+      })
+      .then(() => onClose())
+      .catch(err => setError(String(err && err.message ? err.message : err)))
+      .then(() => setBusy(false))
+  }
+
+  const enter = event => {
+    if (event && event.key === 'Enter') {
+      event.preventDefault()
+      submit()
+    }
+  }
+
+  return jsx(Dialog, {
+    onOpenChange: next => {
+      if (!next && !busy) onClose()
+    },
+    open: true,
+    children: jsxs(DialogContent, {
+      className: 'max-w-md',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'Open worktree' }),
+            jsx('div', {
+              style: S.branchNote,
+              children: `Creates a checkout for ${row.name} under ${folder}/.worktrees.`
+            })
+          ]
+        }),
+        jsxs('div', {
+          style: S.branchField,
+          children: [
+            jsx('label', { style: S.branchLabel, children: 'Worktree name' }),
+            jsx('input', {
+              'aria-label': 'Worktree name',
+              autoFocus: true,
+              disabled: busy,
+              onChange: event => setName(event.target.value),
+              onKeyDown: enter,
+              style: S.branchInput,
+              value: name
+            })
+          ]
+        }),
+        jsxs('div', {
+          style: S.branchField,
+          children: [
+            jsx('label', { style: S.branchLabel, children: 'Base branch' }),
+            jsx('input', {
+              'aria-label': 'Base branch',
+              disabled: busy || exists,
+              onChange: event => setBase(event.target.value),
+              onKeyDown: enter,
+              style: S.branchInput,
+              title: exists ? 'The branch exists, so the worktree checks it out as it is.' : undefined,
+              value: base
+            })
+          ]
+        }),
+        jsx('div', {
+          style: S.branchNote,
+          children: exists
+            ? 'This branch exists, so the worktree checks it out as it is.'
+            : `A new branch ${name.trim() || row.name} starts from the base branch.`
+        }),
+        error ? jsx('div', { role: 'alert', style: S.branchError, children: error }) : null,
+        jsxs('div', {
+          style: S.branchActions,
+          children: [
+            jsx(Button, { disabled: busy, onClick: onClose, size: 'xs', variant: 'ghost', children: 'Cancel' }),
+            jsx(Button, {
+              disabled: busy || !name.trim(),
+              onClick: submit,
+              size: 'xs',
+              variant: 'default',
+              children: busy ? 'Creating' : 'Open worktree'
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+// A switch moves the checkout underneath whatever is open in that folder, so an
+// idle session asks first. A running session is blocked before this dialog.
+function SwitchBranchDialog({ idle, onClose, onConfirm, row }) {
+  return jsx(Dialog, {
+    onOpenChange: next => {
+      if (!next) onClose()
+    },
+    open: true,
+    children: jsxs(DialogContent, {
+      className: 'max-w-md',
+      children: [
+        jsx(DialogHeader, { children: jsx(DialogTitle, { children: 'Switch branch?' }) }),
+        jsx('div', {
+          style: S.branchNote,
+          children: `${idle} idle ${idle === 1 ? 'session is' : 'sessions are'} open in this folder. Switching moves the checkout underneath ${idle === 1 ? 'it' : 'them'}.`
+        }),
+        jsxs('div', {
+          style: S.branchActions,
+          children: [
+            jsx(Button, { onClick: onClose, size: 'xs', variant: 'ghost', children: 'Cancel' }),
+            jsx(Button, {
+              onClick: () => onConfirm(row),
+              size: 'xs',
+              variant: 'default',
+              children: `Switch to ${row.name}`
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+function GithubSection({ folder, mainSessions = [], projectId, sessionsByBranch }) {
   const preset = useValue($ghPreset)
-  // The detail modal's navigation stack: one {kind, number} per open thread, last
-  // on screen. A #123 chip pushes, Back pops, closing empties it, and the whole
-  // thing lives here so a row, a chip and a review all reach the same door.
+  // The detail modal's navigation stack: issue and PR entries carry {kind,
+  // number}; a commit entry carries {kind:'commit', sha}. Last entry on screen.
+  // A #123 chip pushes, Back pops, closing empties it, and the whole thing lives
+  // here so a row, a chip and a review all reach the same door.
   const [stack, setStack] = useState([])
   const [focus, setFocus] = useState(null)
   const [flash, setFlash] = useState(null)
   const [spin, setSpin] = useState(false)
   const [diagOpen, setDiagOpen] = useState(false)
+  // Branch row actions: one worktree modal, one switch confirmation. Both live
+  // here so every row reaches the same instance.
+  const [worktreeRow, setWorktreeRow] = useState(null)
+  const [worktreeOpensSession, setWorktreeOpensSession] = useState(false)
+  const [switchRow, setSwitchRow] = useState(null)
+  const [switchIdle, setSwitchIdle] = useState(0)
+  const [switchOpensSession, setSwitchOpensSession] = useState(false)
+  // One tick set per tab, cumulative by union: Open only by default, and a
+  // second tick ADDS its rows to the same list instead of replacing them.
+  const [statusTicks, setStatusTicks] = useState({ issue: ['open'], pr: ['open'] })
   const forceRef = useRef(0)
   const rootRef = useRef(null)
   // A poke is an atom, not an event: a section that mounts after one (navigating
@@ -3460,12 +5922,13 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
   const mountedAt = useRef(Date.now())
   const path = `path=${encodeURIComponent(folder || '')}`
   const fresh = () => (forceRef.current ? '&refresh=1' : '')
-  // TanStack's refetch() ignores `enabled`, so a closed "shipped" query would
-  // still make a forced read if something called it: only refetch what the
-  // preset is actually showing.
-  const refetchShipped = () => {
-    if (preset === 'shipped' && folder) shippedQuery.refetch()
-  }
+  const toggleStatus = (kind, id) =>
+    setStatusTicks(prev => {
+      const current = prev[kind] || []
+      const next = current.includes(id) ? current.filter(tick => tick !== id) : [...current, id]
+
+      return { ...prev, [kind]: next }
+    })
 
   const repoQuery = useQuery({
     enabled: Boolean(folder),
@@ -3475,20 +5938,23 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
     staleTime: 20000
   })
 
-  const openQuery = useQuery({
+  const boardQuery = useQuery({
     enabled: Boolean(folder),
-    queryKey: [QUERY_ROOT, 'github', 'open', folder],
-    queryFn: () => ghRest(`/github?${path}&state=open&limit=${GH_LIMIT}${fresh()}`),
+    queryKey: [QUERY_ROOT, 'github', 'all', folder],
+    queryFn: () => ghRest(`/github?${path}&state=all&limit=${GH_LIMIT}${fresh()}`),
     retry: false,
     staleTime: 30000
   })
 
-  const shippedQuery = useQuery({
-    enabled: Boolean(folder) && preset === 'shipped',
-    queryKey: [QUERY_ROOT, 'github', 'closed', folder],
-    queryFn: () => ghRest(`/github?${path}&state=closed&limit=${GH_LIMIT}${fresh()}`),
+  // Local git, not GitHub: this query is the tab's only dependency, which is why
+  // the graph body renders before the GitHub gates below. It is enabled only on
+  // the Graph preset, and a forced refresh asks git to skip its fingerprint hit.
+  const graphQuery = useQuery({
+    enabled: Boolean(folder) && preset === 'graph',
+    queryKey: [QUERY_ROOT, 'git', 'graph', folder],
+    queryFn: () => ghRest(`/git/graph?${path}&limit=${GRAPH_WINDOW_LIMIT}${fresh()}`),
     retry: false,
-    staleTime: 60000
+    staleTime: 15000
   })
 
   // Only runs when the panel is open: /diagnose probes GitHub once per available
@@ -3501,7 +5967,7 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
     staleTime: 5000
   })
 
-  const data = openQuery.data || null
+  const data = boardQuery.data || null
   const repo = repoQuery.data || null
   const issues = useMemo(() => (data && data.issues) || [], [data])
   const prs = useMemo(() => (data && data.prs) || [], [data])
@@ -3510,6 +5976,9 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
     () => ghBranchRows({ branches: (repo && repo.branches) || [], prs, sessionsByBranch }),
     [repo, prs, sessionsByBranch]
   )
+  // The main folder's checked-out branch. A detached HEAD reports its sha as
+  // `branch`, so nothing may claim to be current there.
+  const currentBranch = repo && !repo.detached ? String(repo.branch || '') : ''
 
   // Scroll the requested issue or pull request into view once the preset that
   // renders it has painted, then flash it so the jump is legible.
@@ -3534,8 +6003,13 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
   const refresh = () => {
     forceRef.current = 1
     setSpin(true)
-    openQuery.refetch()
-    refetchShipped()
+    // One request per press: the graph does not need a GitHub read, and the
+    // GitHub list does not need git.
+    if (preset === 'graph') {
+      graphQuery.refetch()
+    } else {
+      boardQuery.refetch()
+    }
     schedule(() => {
       forceRef.current = 0
       setSpin(false)
@@ -3555,8 +6029,11 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
 
     forceRef.current = 1
     setSpin(true)
-    openQuery.refetch()
-    refetchShipped()
+    if (preset === 'graph') {
+      graphQuery.refetch()
+    } else {
+      boardQuery.refetch()
+    }
     setFlash({ kind: 'pr', number: poke.pr })
 
     schedule(() => {
@@ -3580,17 +6057,41 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
   }, [])
   const backEntry = useCallback(() => setStack(prev => prev.slice(0, -1)), [])
   const closeEntry = useCallback(() => setStack([]), [])
+  // A commit entry is its own shape: {kind:'commit', sha}. Issue and PR entries
+  // keep {kind, number} exactly as they were, so their modal is untouched.
+  const openCommit = useCallback(sha => {
+    const id = String(sha || '')
+
+    if (!/^[0-9a-fA-F]{7,40}$/.test(id)) return
+    setStack(prev => {
+      const last = prev[prev.length - 1]
+
+      return last && last.kind === 'commit' && last.sha === id ? prev : [...prev, { kind: 'commit', sha: id }]
+    })
+  }, [])
   const currentEntry = stack.length > 0 ? stack[stack.length - 1] : null
 
   // Jumps from a row's linked chips stay list jumps (they also retarget the
   // preset); only the modal's own chips push onto its stack.
+  // A jump has to land: tick the status the target carries so it is on screen,
+  // keeping whatever was already ticked (the union only grows).
+  const revealStatus = (kind, row) => {
+    if (!row) return
+    const bucket = ghStatusBuckets(kind, row)[0]
+    setStatusTicks(prev =>
+      (prev[kind] || []).includes(bucket) ? prev : { ...prev, [kind]: [...(prev[kind] || []), bucket] }
+    )
+  }
+
   const goIssue = number => {
-    writeGhPreset('issue')
+    revealStatus('issue', issues.find(issue => issue.number === number))
+    writeGhPreset('issues')
     setFocus({ kind: 'issue', number, at: Date.now() })
   }
 
   const goPr = number => {
-    writeGhPreset('flight')
+    revealStatus('pr', prs.find(pr => pr.number === number))
+    writeGhPreset('prs')
     setFocus({ kind: 'pr', number, at: Date.now() })
   }
 
@@ -3609,12 +6110,161 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
     })
   }
 
-  const boardFailed = Boolean(openQuery.error) && !data
-  const loading = openQuery.isLoading && !data
+  // Every branch action ends in the same door: a session in a folder, with a
+  // draft that names the branch. Failures are one toast, never a silent click.
+  const startBranchSession = (target, draft) =>
+    openSessionInFolder(target, draft)
+      .then(ok => {
+        if (!ok) host.notify({ kind: 'info', message: 'The session opened, but the draft did not reach the composer.' })
+
+        return ok
+      })
+      .catch(err => {
+        host.notify({
+          kind: 'error',
+          message: `Could not open a session: ${err && err.message ? err.message : err}`
+        })
+
+        return false
+      })
+
+  const branchDraft = (row, where, target) =>
+    branchSessionDraft({
+      branch: row.name,
+      folder: target || folder,
+      owner: ownerName,
+      pr: row.pr,
+      repo: repoName,
+      where
+    })
+
+  // A branch already checked out here has no worktree to make: the main folder
+  // IS that checkout, so the session opens where the work already is.
+  const openSessionOnMain = row => {
+    if (!folder) return Promise.resolve(false)
+
+    return startBranchSession(folder, branchDraft(row, 'Continue on this branch in the main folder.'))
+  }
+
+  // The session door's worktree choice: an existing checkout is reused, a new
+  // one is created through the dialog, and both end in an opened session.
+  const openWorktreeFor = row => {
+    if (!folder) return
+    if (currentBranch && row.name === currentBranch) {
+      openSessionOnMain(row)
+
+      return
+    }
+
+    listWorktrees(folder)
+      .catch(() => null)
+      .then(rows => {
+        const existing = (rows || []).find(tree => tree && tree.branch === row.name && tree.path)
+
+        if (existing) {
+          return startBranchSession(existing.path, branchDraft(row, 'Continue on this branch in the worktree.', existing.path))
+        }
+
+        setWorktreeOpensSession(true)
+        setWorktreeRow(row)
+
+        return null
+      })
+  }
+
+  // The ellipsis stays a git action: it makes the checkout and says so, but it
+  // never opens a session. The session door beside it owns that job.
+  const openWorktreeHere = row => {
+    if (!folder) return
+    if (currentBranch && row.name === currentBranch) {
+      host.notify({ kind: 'info', message: 'That branch is already checked out in the main folder.' })
+
+      return
+    }
+
+    listWorktrees(folder)
+      .catch(() => null)
+      .then(rows => {
+        const existing = (rows || []).find(tree => tree && tree.branch === row.name && tree.path)
+
+        if (existing) {
+          host.notify({ kind: 'info', message: `A worktree for ${row.name} already exists at ${existing.path}.` })
+
+          return null
+        }
+
+        setWorktreeOpensSession(false)
+        setWorktreeRow(row)
+
+        return null
+      })
+  }
+
+  const runSwitch = (row, openSession) => {
+    setSwitchRow(null)
+    ghRest('/branch/switch', { method: 'POST', body: { branch: row.name, path: folder } })
+      .then(res => {
+        if (!res || res.ok !== true) {
+          // The route's own sentence, never a second wording for the same state.
+          host.notify({ kind: 'error', message: String((res && res.error) || 'Could not switch branch.') })
+
+          return false
+        }
+
+        if (res.warning) host.notify({ kind: 'warning', message: String(res.warning) })
+        queryClient.invalidateQueries({ queryKey: [QUERY_ROOT, 'repo', folder] })
+
+        if (!openSession) {
+          host.notify({ kind: 'success', message: `Switched to ${String(res.branch || row.name)}.` })
+
+          return true
+        }
+
+        return startBranchSession(folder, branchDraft(row, 'Continue on this branch in the main folder.'))
+      })
+      .catch(err =>
+        host.notify({
+          kind: 'error',
+          message: `Could not switch branch: ${err && err.message ? err.message : err}`
+        })
+      )
+  }
+
+  // A running turn in this folder is a hard stop: the checkout would move under
+  // a live agent. An idle session still asks, since its tab is on the old
+  // branch. No live session at all switches straight away.
+  const switchBranch = (row, openSession) => {
+    if (!folder) return
+    if ((mainSessions || []).some(s => s && s.running)) {
+      host.notify({
+        kind: 'warning',
+        message: 'A session is running in this folder. Wait for it to finish before switching branches.'
+      })
+
+      return
+    }
+
+    const idle = (mainSessions || []).length
+
+    if (idle > 0) {
+      setSwitchIdle(idle)
+      setSwitchOpensSession(Boolean(openSession))
+      setSwitchRow(row)
+
+      return
+    }
+
+    runSwitch(row, Boolean(openSession))
+  }
+
+  const boardFailed = Boolean(boardQuery.error) && !data
+  const loading = boardQuery.isLoading && !data
   // An older backend reports only `error`; a current one adds a code. Either way
   // a normal condition renders one quiet line, never the error box.
   const boardFailure = data && ((data.code && data.code !== 'ok') || data.error) ? data : null
-  const withoutPr = issues.length - issues.filter(i => linkedPrs.has(i.number)).length
+  // Open issues with no PR: unchanged meaning after the closed half arrived, so
+  // the count is taken over open rows only.
+  const withoutPr = issues.filter(i => String(i.state || 'open').toLowerCase() === 'open' && !linkedPrs.has(i.number)).length
 
   const groupLabel = (text, count) =>
     jsxs('div', {
@@ -3622,14 +6272,62 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
       children: [jsx('span', { children: text }), count != null ? jsx('span', { style: S.count, children: count }) : null]
     })
 
-  const flightView = () => {
-    const rows = [...prs].sort((a, b) => ghMs(b.updated_at) - ghMs(a.updated_at))
+  // The filter row: one dense line of toggles under the tab strip, on the two
+  // tabs a status can cut. Cumulative by union, never a request.
+  const statusRow = kind => {
+    const options = GH_STATUS_FILTERS[kind] || []
+    const ticks = statusTicks[kind] || []
+    const shown = ghFilterRows(kind, kind === 'pr' ? prs : issues, ticks).length
+    const all = (kind === 'pr' ? prs : issues).length
+
+    return jsxs('div', {
+      'aria-label': kind === 'pr' ? 'Pull request status filters' : 'Issue status filters',
+      role: 'group',
+      style: S.ghFilters,
+      children: [
+        ...options.map(option =>
+          jsxs(
+            'button',
+            {
+              'aria-pressed': ticks.includes(option.id),
+              className: `pcc-gh-filter${ticks.includes(option.id) ? ' is-on' : ''}`,
+              onClick: () => toggleStatus(kind, option.id),
+              style: ticks.includes(option.id)
+                ? { ...S.ghFilterBtn, ...S.ghFilterOn, color: GH_STATUS_COLORS[option.id] || 'var(--ui-text-secondary)' }
+                : S.ghFilterBtn,
+              title: `${ticks.includes(option.id) ? 'Hide' : 'Show'} ${option.label.toLowerCase()}`,
+              type: 'button',
+              children: option.label
+            },
+            `${kind}-${option.id}`
+          )
+        ),
+        jsx('span', { style: S.grow }),
+        jsx('span', {
+          style: S.ghFilterCount,
+          children: shown === all ? `${all}` : `${shown} of ${all}`
+        })
+      ]
+    })
+  }
+
+  const prView = () => {
+    const rows = ghFilterRows('pr', prs, statusTicks.pr).sort(
+      (a, b) => stampMs(b.updated_at) - stampMs(a.updated_at)
+    )
+    const empty =
+      (statusTicks.pr || []).length === 0
+        ? 'No pull requests'
+        : `No ${(statusTicks.pr || [])
+            .map(id => (GH_STATUS_FILTERS.pr.find(option => option.id === id) || {}).label || id)
+            .join(' or ')
+            .toLowerCase()} pull requests`
 
     return jsxs('div', {
       style: S.ghList,
       children: [
         rows.length === 0
-          ? jsx('div', { style: S.ghQuiet, children: 'No open pull requests' })
+          ? jsx('div', { style: S.ghQuiet, children: empty })
           : rows.map(pr =>
               jsx(
                 GhPrRow,
@@ -3648,7 +6346,7 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
               style: { paddingTop: 6 },
               children: jsxs('button', {
                 className: 'pcc-gh-linkbtn',
-                onClick: () => writeGhPreset('issue'),
+                onClick: () => writeGhPreset('issues'),
                 style: S.ghLinkBtn,
                 type: 'button',
                 children: [
@@ -3663,16 +6361,23 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
   }
 
   const issueView = () => {
-    const rows = [...issues].sort(
+    const rows = ghFilterRows('issue', issues, statusTicks.issue).sort(
       (a, b) =>
-        (linkedPrs.has(b.number) ? 1 : 0) - (linkedPrs.has(a.number) ? 1 : 0) || ghMs(b.updated_at) - ghMs(a.updated_at)
+        (linkedPrs.has(b.number) ? 1 : 0) - (linkedPrs.has(a.number) ? 1 : 0) || stampMs(b.updated_at) - stampMs(a.updated_at)
     )
+    const empty =
+      (statusTicks.issue || []).length === 0
+        ? 'No issues'
+        : `No ${(statusTicks.issue || [])
+            .map(id => (GH_STATUS_FILTERS.issue.find(option => option.id === id) || {}).label || id)
+            .join(' or ')
+            .toLowerCase()} issues`
 
     return jsxs('div', {
       style: S.ghList,
       children: [
         rows.length === 0
-          ? jsx('div', { style: S.ghQuiet, children: 'No open issues' })
+          ? jsx('div', { style: S.ghQuiet, children: empty })
           : rows.map(issue =>
               jsx(
                 GhIssueRow,
@@ -3703,7 +6408,23 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
       children: [
         rows.length === 0
           ? jsx('div', { style: S.ghQuiet, children: 'No branches to join against yet' })
-          : rows.map(row => jsx(GhBranchRow, { onIssue: goIssue, onOpenPr: goPr, row }, row.name)),
+          : rows.map(row =>
+              jsx(
+                GhBranchRow,
+                {
+                  currentBranch,
+                  onCheckout: row => switchBranch(row, true),
+                  onIssue: goIssue,
+                  onOpenPr: goPr,
+                  onOpenSessionHere: openSessionOnMain,
+                  onOpenWorktree: openWorktreeHere,
+                  onSessionWorktree: openWorktreeFor,
+                  onSwitch: row => switchBranch(row, false),
+                  row
+                },
+                row.name
+              )
+            ),
         hidden > 0 ? jsx('div', { style: S.ghQuiet, children: `${hidden} more branches` }) : null
       ]
     })
@@ -3716,7 +6437,9 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
         (a, b) =>
           (b[1].live > 0 ? 1 : 0) - (a[1].live > 0 ? 1 : 0) || b[1].count - a[1].count || a[0].localeCompare(b[0])
       )
-    const prsNoIssue = prs.filter(pr => (pr.linked_issues || []).length === 0)
+    const prsNoIssue = prs.filter(
+      pr => String(pr.state || 'open').toLowerCase() === 'open' && (pr.linked_issues || []).length === 0
+    )
 
     return jsxs('div', {
       style: S.ghList,
@@ -3765,43 +6488,6 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
                 pr.number
               )
             )
-      ]
-    })
-  }
-
-  const shippedView = () => {
-    if (shippedQuery.isLoading && !shippedQuery.data) return jsx(GhSkeleton, {})
-    if (shippedQuery.error && !shippedQuery.data) {
-      return jsx('div', { style: S.ghQuiet, children: 'Could not load merged pull requests.' })
-    }
-
-    const shipped = shippedQuery.data || null
-
-    if (shipped && ((shipped.code && shipped.code !== 'ok') || shipped.error)) {
-      return jsx(GhFailure, { data: shipped, folder })
-    }
-    const merged = ((shipped && shipped.prs) || [])
-      .filter(pr => pr.merged)
-      .sort((a, b) => ghMs(b.updated_at) - ghMs(a.updated_at))
-    const rows = merged.slice(0, SHIPPED_CAP)
-    const hidden = merged.length - rows.length
-
-    return jsxs('div', {
-      style: S.ghList,
-      children: [
-        rows.length === 0
-          ? jsx('div', { style: S.ghQuiet, children: 'No merged pull requests in the recent window' })
-          : rows.map(pr =>
-              jsx(
-                GhShippedRow,
-                {
-                  onOpen: () => openEntry('pr', pr.number),
-                  pr
-                },
-                pr.number
-              )
-            ),
-        hidden > 0 ? jsx('div', { style: S.ghQuiet, children: `showing ${rows.length} of ${merged.length}` }) : null
       ]
     })
   }
@@ -3886,9 +6572,23 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
     })
   }
 
+  // Local git only: this branch is chosen before the backend, loading and
+  // board-failure gates, because none of those should be able to hide history
+  // that `git` can read without GitHub.
+  const graphView = () =>
+    jsx(GitGraphView, {
+      data: graphQuery.data || null,
+      error: graphQuery.error,
+      folder,
+      loading: graphQuery.isLoading && !graphQuery.data,
+      onOpenCommit: openCommit
+    })
+
   let body
 
-  if (boardFailed) {
+  if (preset === 'graph') {
+    body = graphView()
+  } else if (boardFailed) {
     body = jsx('div', {
       style: S.ghErrorWrap,
       children: jsx(ErrorState, {
@@ -3909,16 +6609,14 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
     body = jsx(GhSkeleton, {})
   } else if (boardFailure) {
     body = jsx(GhFailure, { data: boardFailure, folder })
-  } else if (preset === 'issue') {
+  } else if (preset === 'issues') {
     body = issueView()
-  } else if (preset === 'branch') {
+  } else if (preset === 'branches') {
     body = branchView()
   } else if (preset === 'unlinked') {
     body = unlinkedView()
-  } else if (preset === 'shipped') {
-    body = shippedView()
   } else {
-    body = flightView()
+    body = prView()
   }
 
   return jsxs('section', {
@@ -3950,9 +6648,9 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
             : null,
           jsx('span', { style: S.grow }),
           jsx(Tip, {
-            label: 'Refresh GitHub',
+            label: preset === 'graph' ? 'Refresh history' : 'Refresh GitHub',
             children: jsx(Button, {
-              'aria-label': 'Refresh GitHub',
+              'aria-label': preset === 'graph' ? 'Refresh history' : 'Refresh GitHub',
               disabled: spin,
               onClick: refresh,
               size: 'icon-xs',
@@ -3995,26 +6693,90 @@ function GithubSection({ folder, projectId, sessionsByBranch }) {
             value: preset
           }),
           jsx('span', { style: S.grow }),
-          data && data.counts ? jsx(GhTotals, { counts: data.counts }) : null
+          preset === 'graph'
+            ? graphQuery.data && graphQuery.data.ok !== false && Array.isArray(graphQuery.data.commits)
+              ? jsx('span', {
+                  style: S.count,
+                  children: `${graphQuery.data.commits.length} commits${graphQuery.data.truncated ? ', more history' : ''}`
+                })
+              : null
+            : data && data.counts
+              ? jsx(GhTotals, { counts: data.counts })
+              : null
         ]
       }),
+      preset === 'issues' || preset === 'prs'
+        ? data && !boardFailure
+          ? statusRow(preset === 'issues' ? 'issue' : 'pr')
+          : null
+        : null,
       diagnoseView(),
       body,
       currentEntry
-        ? jsx(
-            GhDetailModal,
-            {
-              depth: stack.length,
-              entry: currentEntry,
-              folder,
-              onBack: backEntry,
-              onClose: closeEntry,
-              onOpen: openEntry,
-              owner: ownerName,
-              repo: repoName
+        ? currentEntry.kind === 'commit'
+          ? jsx(
+              GitCommitModal,
+              {
+                depth: stack.length,
+                entry: currentEntry,
+                folder,
+                onBack: backEntry,
+                onClose: closeEntry,
+                onOpen: openEntry,
+                onOpenCommit: openCommit,
+                owner: ownerName,
+                repo: repoName
+              },
+              `commit-${currentEntry.sha}`
+            )
+          : jsx(
+              GhDetailModal,
+              {
+                depth: stack.length,
+                entry: currentEntry,
+                folder,
+                onBack: backEntry,
+                onClose: closeEntry,
+                onOpen: openEntry,
+                owner: ownerName,
+                repo: repoName
+              },
+              `${currentEntry.kind}-${currentEntry.number}`
+            )
+        : null,
+      worktreeRow
+        ? jsx(WorktreeDialog, {
+            folder,
+            onClose: () => setWorktreeRow(null),
+            onCreated: (target, res) => {
+              if (!worktreeOpensSession) {
+                host.notify({ kind: 'success', message: `Worktree created at ${target}` })
+
+                return target
+              }
+
+              return startBranchSession(
+                target,
+                branchSessionDraft({
+                  branch: String((res && res.branch) || worktreeRow.name),
+                  folder: target,
+                  owner: ownerName,
+                  pr: worktreeRow.pr,
+                  repo: repoName,
+                  where: 'Continue on this branch in the new worktree.'
+                })
+              )
             },
-            `${currentEntry.kind}-${currentEntry.number}`
-          )
+            row: worktreeRow
+          })
+        : null,
+      switchRow
+        ? jsx(SwitchBranchDialog, {
+            idle: switchIdle,
+            onClose: () => setSwitchRow(null),
+            onConfirm: () => runSwitch(switchRow, switchOpensSession),
+            row: switchRow
+          })
         : null
     ]
   })
@@ -4079,7 +6841,7 @@ function laneGroups(node) {
   return out
 }
 
-function DetailSessionRow({ session, state, onOpen }) {
+function DetailSessionRow({ session, state, onOpen, lane }) {
   const ms = sessionStamp(session)
   const model = shortModel(session.model)
   const running = RUNNING.has(state)
@@ -4097,13 +6859,14 @@ function DetailSessionRow({ session, state, onOpen }) {
         style: { display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 },
         children: [
           state && state !== 'idle' ? jsx('span', { style: { display: 'inline-flex', flex: 'none' }, children: jsx(LiveDot, { state }) }) : null,
-          jsx('span', { style: S.laneRowTitle, children: sessionTitle(session) })
+          jsx('span', { style: S.laneRowTitle, children: sessionTitle(session) }),
+          lane ? jsx('span', { style: { display: 'inline-flex', flex: 'none', marginLeft: 'auto' }, children: jsx(LaneBadge, { lane }) }) : null
         ]
       }),
       jsxs('span', {
         style: S.laneRowMeta,
         children: [
-          ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { children: ago(ms) }) }) : null,
+          ms ? jsx(Tip, { label: stampTip(ms), children: jsx('span', { children: ageText(ms) }) }) : null,
           model ? jsx('span', { children: model }) : null,
           messages ? jsx('span', { children: `${messages} ${messages === 1 ? 'message' : 'messages'}` }) : null,
           tokens
@@ -4164,13 +6927,24 @@ function ProjectDetailPage() {
   const project = (detail.data && detail.data.project) || node
   // Mounting the same /board read here keeps the header's status picker on the
   // server copy even when the detail page is opened first (a tab or deep link),
-  // and the project sync keeps the backend's cwd index fresh either way.
-  useBoard()
+  // and the project sync keeps the backend's cwd index fresh either way. The
+  // same read carries each session's link row, which the lane badge resolves
+  // from, so the page never asks for it twice.
+  const boardState = useBoard()
   const treeProjects = useMemo(() => (tree.data && tree.data.projects) || [], [tree.data])
 
   useProjectSync(treeProjects)
   const lanes = useMemo(() => (project ? laneGroups(project) : []), [project])
   const folderPath = useMemo(() => (project ? primaryPath(project) : ''), [project])
+  const pageProjects = useMemo(() => (project ? [project] : []), [project])
+  const linkBySession = useMemo(() => linksBySession(boardState.links), [boardState.links])
+  const refsByProject = useProjectRefs(pageProjects, boardState.links)
+  const projectLane = project ? statuses[project.id] : ''
+  const projectRefs = project ? refsByProject.get(project.id) : null
+  const laneOf = useCallback(
+    id => laneForLink(linkBySession.get(id), projectRefs, projectLane),
+    [linkBySession, projectRefs, projectLane]
+  )
 
   // The header names the work tree a vault subfolder really belongs to. Same
   // queryKey as the GitHub section's read, so react-query answers both with one
@@ -4193,6 +6967,34 @@ function ProjectDetailPage() {
   }, [lanes, live.byStored])
 
   const sessionsByBranch = useMemo(() => branchSessionMap(lanes, live.byStored), [lanes, live.byStored])
+
+  // Sessions the project query places in the header folder, plus whether each
+  // is mid-turn. `session.active_list` is the only SDK read of live state, and
+  // it carries no cwd, so the folder comes from each lane's checkout path (or
+  // the session's own cwd) and the two are joined by stored id.
+  const folderSessions = useMemo(() => {
+    const key = String(folderPath || '').replace(/\/+$/, '')
+    const out = []
+
+    if (!key) return out
+    for (const group of lanes) {
+      for (const s of group.sessions || []) {
+        const lanePath = String((group.lane && group.lane.path) || '').replace(/\/+$/, '')
+        const cwd = String(s.cwd || '').replace(/\/+$/, '')
+        const inside = lanePath === key || cwd === key || (cwd ? cwd.startsWith(`${key}/`) : false)
+
+        if (!inside) continue
+        const state = live.byStored.get(s.id)
+
+        if (!state) continue
+        // A waiting turn is an open turn asking for the user; moving the
+        // checkout under it is as wrong as moving it under a running one.
+        out.push({ id: s.id, running: RUNNING.has(state) || state === 'waiting' })
+      }
+    }
+
+    return out
+  }, [folderPath, lanes, live.byStored])
 
   const refresh = () => {
     setSpin(true)
@@ -4238,6 +7040,21 @@ function ProjectDetailPage() {
   const folderPaths = folderList(project)
   const path = primaryPath(project)
   const updatedMs = projectRecency(project)
+  // The header's New session folder: the primary folder while /repo can read
+  // it, else the first other repo folder the project records. Existence is
+  // verified only for the primary (the /repo read above), never assumed for a
+  // path the backend did not answer for.
+  const repoData = repoInfo.data || null
+  const sessionFolder = (() => {
+    const missing = Boolean(repoData && repoData.code === 'folder_missing')
+
+    if (path && !missing) return path
+    const alt = (project.repos || [])
+      .map(repo => String((repo && repo.path) || '').trim())
+      .find(folder => folder && folder !== path)
+
+    return alt || ''
+  })()
 
   return jsxs('div', {
     style: S.page,
@@ -4259,7 +7076,26 @@ function ProjectDetailPage() {
           jsxs('div', {
             style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: '1 1 200px' },
             children: [
-              jsx('h1', { style: S.detailTitle, children: project.label }),
+              jsxs('div', {
+                style: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flexWrap: 'wrap' },
+                children: [
+                  jsx('h1', { style: S.detailTitle, children: project.label }),
+                  repoData && (repoData.detached || repoData.branch)
+                    ? jsx(BranchChip, {
+                        branch: repoData.detached ? 'detached' : String(repoData.branch),
+                        title: repoData.detached
+                          ? 'The main folder is on a detached HEAD'
+                          : 'The main folder is on this branch'
+                      })
+                    : null,
+                  jsx(NewSessionButton, {
+                    branch: repoData && !repoData.detached ? repoData.branch || '' : '',
+                    folder: sessionFolder,
+                    owner: (repoData && repoData.owner) || '',
+                    repo: (repoData && repoData.repo) || ''
+                  })
+                ]
+              }),
               jsx(PathLine, {
                 path,
                 inside: (repoInfo.data && repoInfo.data.inside_root) || null
@@ -4308,10 +7144,10 @@ function ProjectDetailPage() {
               jsx(Stat, { label: 'Tokens', tip: `${(project.totalTokens || 0).toLocaleString()} tokens`, value: formatTokens(project.totalTokens) }),
               jsx(Stat, { label: 'Cost', value: formatCost(project.totalCostUsd) || '-' }),
               jsx(Stat, { label: 'Folders', tip: folderPaths.join('\n') || undefined, value: folderPaths.length }),
-              jsx(Stat, { label: 'Last updated', tip: stampTip(updatedMs), value: updatedMs ? ago(updatedMs) : 'No activity' })
+              jsx(Stat, { label: 'Last updated', tip: stampTip(updatedMs), value: updatedMs ? ageText(updatedMs) : 'No activity' })
             ]
           }),
-          path ? jsx(GithubSection, { folder: path, projectId: project.id, sessionsByBranch }) : null,
+          path ? jsx(GithubSection, { folder: path, mainSessions: folderSessions, projectId: project.id, sessionsByBranch }) : null,
           jsxs('div', {
             style: { display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 },
             children: [
@@ -4353,7 +7189,13 @@ function ProjectDetailPage() {
                           }),
                           group.sessions.length === 0
                             ? jsx('div', { style: S.laneQuiet, children: 'No sessions on this lane' })
-                            : group.sessions.map(s => jsx(DetailSessionRow, { onOpen: openSession, session: s, state: live.byStored.get(s.id) }, s.id))
+                            : group.sessions.map(s =>
+                                jsx(
+                                  DetailSessionRow,
+                                  { lane: laneOf(s.id), onOpen: openSession, session: s, state: live.byStored.get(s.id) },
+                                  s.id
+                                )
+                              )
                         ]
                       },
                       group.key
@@ -4406,6 +7248,12 @@ function ProjectsPage() {
   // route is not mounted yet. Project sync rides the same read.
   const boardState = useBoard()
   const linksForProject = useMemo(() => linksByProject(boardState.links), [boardState.links])
+  const linkRowsForProject = useMemo(() => linkRowsByProject(boardState.links), [boardState.links])
+  const linkBySession = useMemo(() => linksBySession(boardState.links), [boardState.links])
+  // PR state for every linked pull request on the page, so a session with no
+  // explicit status can still read as review or done. Empty before the restart:
+  // the project lane answers instead.
+  const refsByProject = useProjectRefs(projects, boardState.links)
   // One /github/counts read for every column; a column takes its own folder's entry.
   const repoCounts = useRepoCounts(projects)
 
@@ -4419,6 +7267,25 @@ function ProjectsPage() {
 
     return map
   }, [projects])
+  // The same three inputs the badge resolves with, for the live strip whose
+  // rows are sessions from any project on the board.
+  const projectByStored = useMemo(() => {
+    const map = new Map()
+
+    for (const p of projects) {
+      for (const id of p.sessionIds || []) if (!map.has(id)) map.set(id, p.id)
+    }
+
+    return map
+  }, [projects])
+  const laneForSession = useCallback(
+    key => {
+      const projectId = projectByStored.get(key)
+
+      return laneForLink(linkBySession.get(key), refsByProject.get(projectId), projectId ? statuses[projectId] : '')
+    },
+    [projectByStored, linkBySession, refsByProject, statuses]
+  )
 
   const q = search.trim().toLowerCase()
   const sortId = useValue($sort)
@@ -4468,11 +7335,14 @@ function ProjectsPage() {
           {
             index: i,
             counts: Object.prototype.hasOwnProperty.call(repoCounts, primaryPath(p)) ? repoCounts[primaryPath(p)] : null,
+            lane: statuses[p.id],
+            linkRows: linkRowsForProject.get(p.id) || NO_LINKS,
             links: linksForProject.get(p.id),
             liveByStored: live.byStored,
             onOpenProject: openProject,
             onOpenSession: openSession,
             project: p,
+            refs: refsByProject.get(p.id),
             status: statuses[p.id] || DEFAULT_STATUS
           },
           p.id
@@ -4515,7 +7385,13 @@ function ProjectsPage() {
         ]
       }),
       board,
-      jsx(LiveStrip, { items: live.items, loading: live.query.isLoading, onOpenSession: openSession, projectBySession })
+      jsx(LiveStrip, {
+        items: live.items,
+        laneFor: laneForSession,
+        loading: live.query.isLoading,
+        onOpenSession: openSession,
+        projectBySession
+      })
     ]
   })
 }

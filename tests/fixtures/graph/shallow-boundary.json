@@ -1,0 +1,61 @@
+{
+  "description": "An empty parent list mid-window is a shallow boundary: the lane ends at that dot, and the next history starts in a fresh lane.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "a",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "a"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "a",
+        "parents": [
+          "b"
+        ],
+        "subject": "a"
+      },
+      {
+        "sha": "b",
+        "parents": [],
+        "subject": "b"
+      },
+      {
+        "sha": "z",
+        "parents": [
+          "y"
+        ],
+        "subject": "z"
+      },
+      {
+        "sha": "y",
+        "parents": [],
+        "subject": "y"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 2,
+    "maxLanes": 2,
+    "lanes": {
+      "a": 0,
+      "b": 0,
+      "z": 1,
+      "y": 1
+    },
+    "roots": {
+      "b": 0,
+      "y": 1
+    }
+  },
+  "name": "shallow-boundary"
+}

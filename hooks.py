@@ -4,12 +4,14 @@ Two hooks, both synchronous and local. Neither opens a socket, starts a process 
 credential: the only files either one touches are the SQLite board and (on a link-row miss) the
 session database, both through ``board_store.py``.
 
-  * ``pre_llm_call``   read only. The session's project card, one line per part, at most 400
-    characters, injected into the turn's user message. No project, no injection. Three
-    primary-key lookups, never a scan of the board.
+  * ``pre_llm_call``   read only. The card this session works in, one line per part, at most 400
+    characters, injected into the turn's user message. The lane named is the session's own when it
+    has one, else the project's. No project, no injection. Three primary-key lookups, never a scan
+    of the board.
   * ``post_tool_call`` after a ``terminal`` call that actually ran ``gh pr create`` and whose result
     printed a ``github.com/<owner>/<repo>/pull/<n>`` URL: records that PR on the session's link row,
-    and moves the card to ``review`` when it was still ``backlog`` or ``active``.
+    then moves that session's lane to ``review`` when it was unset, ``backlog`` or ``active``, and
+    moves the project's lane the same way.
 
 Both fail open: every failure is a logged ``None``, because a hook that raises must never cost a
 turn. ``post_tool_call`` additionally honours a kill file — ``auto_link.off`` in the plugin's data
@@ -41,6 +43,8 @@ MAX_CONTEXT = 400
 LANES = "backlog, active, review, blocked, done"
 AUTO_STATUS = "review"
 AUTO_FROM = ("backlog", "active")
+# A session's lane is null until something sets it, so its "not started yet" value is "".
+SESSION_AUTO_FROM = ("", "backlog", "active")
 
 # The command, not a substring: an agent may `grep -rn 'gh pr create' .` or `gh pr view` and print a
 # PR URL without ever creating one. A real invocation starts a command (start of text or a newline)
@@ -180,11 +184,13 @@ def pre_llm_call(**kwargs: Any) -> Optional[dict[str, str]]:
             if not project_id:
                 return None
             card = store.card_for_project(project_id, session_id=session_id)
-        status = card.get("status") or {}
         project = card.get("project") or {}
         if _is_home_bucket(project):
             return None
-        lane = status.get("status") or "backlog (unset)"
+        # The session's own lane wins; the store's resolve_lane holds the same rule the Desktop
+        # renderer applies to the rows /board hands it.
+        lane_info = card.get("lane") or store.resolve_lane(link, card.get("status"))
+        lane = lane_info.get("status") or "backlog (unset)"
         label = str(project.get("label") or project_id)
         return {"context": _context(label, lane, link.get("issue"), link.get("title") or "",
                                     link.get("pr"))}
@@ -276,6 +282,11 @@ def _auto_link(payload: dict[str, Any]) -> bool:
     if not store.set_link(key, project_id, repo=repo or None, pr=pr,
                           pr_url=match.group(0)).get("ok"):
         return False
+    # The session's own lane follows the PR too, but only out of a pre-review lane: a card a person
+    # already moved to review, blocked or done is theirs, and the compare-and-set loses to them.
+    session_lane = str(row.get("status") or "").strip().lower()
+    if session_lane in SESSION_AUTO_FROM:
+        store.move_session_status_if_current(key, session_lane, AUTO_STATUS, None, "auto")
     status = store.get_status(project_id) or {}
     if status.get("status") in AUTO_FROM:
         # Compare-and-set: a user's move to another lane between this read and the write wins.

@@ -6,6 +6,12 @@ with ``ctx.rest('/repo?path=...')``.
 
   * git: work tree, remote, branch, dirty counts, ahead/behind and branches for
     one folder, cached 20 s per resolved root (a board asks for many projects).
+  * git history: ``GET /git/graph`` returns the newest commits across local
+    branches, remotes and HEAD for the graph tab, cached 300 s under a
+    fingerprint of the refs and HEAD, so a re-opened tab pays three cheap reads
+    and no log; ``GET /git/commit/{sha}`` returns one commit with a unified diff
+    against its first parent, capped while it is read. Fixed argv, no shell, and
+    no git command mutates the repository.
   * GitHub: issues and pull requests for that folder's ``origin``, with PR to
     issue links taken from GraphQL ``closingIssuesReferences`` (GitHub's own
     answer) merged with the ``closes #12`` body fallback. One issue or PR
@@ -19,13 +25,17 @@ with ``ctx.rest('/repo?path=...')``.
     ``/board/projects`` and ``/board/seed`` write it, each inside one short SQLite
     transaction, and each broadcast ``board.changed`` so the Desktop refreshes.
   * icons: ``GET /icon`` answers "what is the best icon for this folder" from a
-    fixed candidate path list (no tree walk) with the bytes sniffed, then a remote
-    favicon or the GitHub owner avatar behind an SSRF guard and a kill file, then
-    a stack key (``laravel``, ``nuxt``, ``python``, ...) for the Desktop's glyph.
+    fixed candidate path list first, then one bounded walk for a nested
+    ``public`` directory, with the bytes sniffed, then a remote favicon or the
+    GitHub owner avatar behind an SSRF guard and a kill file, then a stack key
+    (``laravel``, ``nuxt``, ``python``, ...) for the Desktop's glyph.
     It always answers 200: an image, a glyph, or a code for a folder that is gone.
 
-No git writes: no git command mutates a repository. GitHub writes are four
-routes and nothing else: ``POST /github/issue/{n}/comment`` and
+Git is read only except one route: ``POST /branch/switch`` runs ``git switch``
+on the main checkout after refusing a dirty tree, a linked worktree, a branch
+checked out elsewhere and any in-progress operation. It never stashes, never
+discards and never forces, and every git child is a fixed argv.
+GitHub writes are four routes and nothing else: ``POST /github/issue/{n}/comment`` and
 ``POST /github/pr/{n}/comment`` post one comment, and
 ``POST /github/issue/{n}/state`` / ``POST /github/pr/{n}/state`` set open or
 closed. All four write over the authenticated ``gh`` CLI as that account (never
@@ -41,10 +51,11 @@ that GitHub rejects is retried once through ``gh``, and ``auth``/``auth_note``
 report which credential answered and why it changed; the token value itself is
 never logged, returned or compared against a file.
 
-Failures are codes, not exceptions: every repo, GitHub, PR and issue payload
-carries ``ok``, ``code`` (``folder_missing``, ``not_a_repo``, ``no_remote``,
-``repo_not_found``, ``no_auth``, ``rate_limited``, ``network``,
-``upstream_error``, or ``ok``), ``error`` (one human sentence) and ``detail``
+Failures are codes, not exceptions: every repo, git history, GitHub, PR and
+issue payload carries ``ok``, ``code`` (``folder_missing``, ``not_a_repo``,
+``no_remote``, ``repo_not_found``, ``no_auth``, ``rate_limited``, ``network``,
+``upstream_error``, ``empty_repo``, ``bad_sha``, or ``ok``), ``error`` (one
+human sentence) and ``detail``
 (the endpoint and status), all with HTTP 200, so the Desktop half renders one
 quiet line instead of a bare status. Only a malformed path is a 400.
 ``GET /diagnose`` reports folder, git, token presence, gh login and a labelled
@@ -61,6 +72,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import importlib.util
 import ipaddress
 import json
@@ -71,10 +83,11 @@ import shutil
 import socket
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple, Optional, Sequence, TypedDict, Union
-from urllib.parse import urlencode, urljoin, urlsplit
+from typing import Any, Mapping, NamedTuple, NotRequired, Optional, Sequence, TypedDict, Union
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -84,8 +97,12 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 PLUGIN_NAME = "project-command-center"
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 GIT_TIMEOUT = 5.0
+# A checkout is the one git call that can legitimately take minutes: a large tree,
+# an LFS smudge, a slow disk. Killing it mid-run leaves a half-moved work tree and
+# a stale index.lock, so the switch gets its own budget instead of GIT_TIMEOUT.
+SWITCH_TIMEOUT = 120.0
 GH_TIMEOUT = 15.0  # the GraphQL PR pass is the slow gh call; everything else is under a second
 HTTP_TIMEOUT = 10.0
 REPO_TTL = 20.0
@@ -104,8 +121,12 @@ MAX_COUNT_PATHS = 50
 API = "https://api.github.com"
 
 ISOLATION_NOTE = (
-    "git runs as a local subprocess inside the gateway process (no shell, 5 s timeout), "
-    "only inside the absolute folder passed as path. GitHub reads go to api.github.com using the "
+    "git runs as a local subprocess inside the gateway process (no shell, 5 s for a status "
+    "read and 15 s for a commit diff), "
+    "only inside the absolute folder passed as path. It reads history and diffs for the graph "
+    "routes; a diff runs with --no-ext-diff --no-textconv --no-show-signature, because a "
+    "repository's own config can name a diff driver, a textconv command or a gpg program, and is "
+    "cut at 512 KiB, 6,000 lines and 300 files. GitHub reads go to api.github.com using the "
     "profile's GITHUB_TOKEN, or through your authenticated gh CLI when no token is set. GitHub "
     "writes (a comment on an issue or pull request, and opening or closing one) run only through "
     "your authenticated gh CLI, as that account, with the request body on the child's stdin. The "
@@ -141,10 +162,14 @@ class IssueRow(TypedDict):
     number: int
     title: str
     state: str
+    state_reason: Optional[str]
     url: Optional[str]
     author: Optional[str]
+    author_avatar: NotRequired[str]
+    author_bot: bool
     labels: list[str]
     assignees: list[str]
+    assignee_avatars: NotRequired[dict[str, str]]
     comments: int
     updated_at: Optional[str]
     created_at: Optional[str]
@@ -164,6 +189,8 @@ class PullRow(TypedDict):
     merged: bool
     url: Optional[str]
     author: Optional[str]
+    author_avatar: NotRequired[str]
+    author_bot: bool
     head_ref: str
     base_ref: str
     updated_at: Optional[str]
@@ -183,6 +210,8 @@ class CommentRow(TypedDict):
 
     id: int
     author: Optional[str]
+    author_avatar: NotRequired[str]
+    author_bot: bool
     body: str
     created_at: Optional[str]
     updated_at: Optional[str]
@@ -191,6 +220,8 @@ class CommentRow(TypedDict):
 
 class ReviewRow(TypedDict):
     author: Optional[str]
+    author_avatar: NotRequired[str]
+    author_bot: bool
     state: Optional[str]
     body: str
     submitted_at: Optional[str]
@@ -203,7 +234,12 @@ class RefRow(TypedDict):
     kind: str  # "issue" | "pr"
     title: str
     state: str
+    state_reason: NotRequired[Optional[str]]
+    draft: NotRequired[bool]
+    merged: NotRequired[bool]
     author: Optional[str]
+    author_avatar: NotRequired[str]
+    author_bot: bool
     updated_at: Optional[str]
     url: Optional[str]
 
@@ -231,8 +267,82 @@ def _int(value: Any) -> int:
         return 0
 
 
-def _login(value: Any) -> Optional[str]:
-    return value.get("login") if isinstance(value, dict) else None
+# GitHub serves avatars from this one host. A payload keeps a URL only when it
+# is https, exactly that host, and a query made of ``s``, ``v`` and ``u``: the
+# renderer loads it as an image, so anything else is a URL someone else chose.
+AVATAR_HOST = "avatars.githubusercontent.com"
+AVATAR_SIZE = 48
+# ``s`` and ``v`` come from REST; GraphQL adds ``u``, the user id hash. Anything
+# else is someone else's parameter.
+_AVATAR_QUERY_KEYS = frozenset({"s", "v", "u"})
+
+
+def _avatar_url(value: Any) -> Optional[str]:
+    """A normalized GitHub avatar URL, or None for anything off the allow-list.
+
+    The size is always rewritten to ``s=48`` (``v`` and the GraphQL ``u`` are
+    kept), so one user is one browser cache entry. A foreign host, http,
+    userinfo, a path that climbs, or an unknown query parameter is dropped
+    instead of passed through.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or parts.hostname != AVATAR_HOST:
+        return None
+    if port not in (None, 443):
+        return None
+    if parts.username or parts.password or not parts.path.startswith("/"):
+        return None
+    if parts.path in ("", "/") or ".." in parts.path:
+        return None
+    kept: list[tuple[str, str]] = []
+    for key, val in parse_qsl(parts.query, keep_blank_values=True):
+        if key not in _AVATAR_QUERY_KEYS:
+            return None
+        if key != "s":
+            kept.append((key, val))
+    kept.append(("s", str(AVATAR_SIZE)))
+    return urlunsplit(("https", AVATAR_HOST, parts.path, urlencode(kept), ""))
+
+
+def _actor(user: Any) -> tuple[Optional[str], Optional[str], bool]:
+    """(login, avatar, bot) from a REST user or a GraphQL author node.
+
+    REST says ``avatar_url`` and ``type: "Bot"``; GraphQL says ``avatarUrl`` and
+    ``__typename: "Bot"``. A GraphQL bot login has no ``[bot]`` suffix, so the
+    flag has to come from this field and not from sniffing the login.
+    """
+    if not isinstance(user, dict):
+        return None, None, False
+    login = user.get("login")
+    login = login if isinstance(login, str) and login else None
+    avatar = _avatar_url(user.get("avatar_url") or user.get("avatarUrl"))
+    bot = str(user.get("type") or user.get("__typename") or "") == "Bot"
+    return login, avatar, bot
+
+
+def _actor_fields(user: Any) -> dict[str, Any]:
+    """The author triple for a payload; ``author_avatar`` is absent, not null."""
+    login, avatar, bot = _actor(user)
+    fields: dict[str, Any] = {"author": login, "author_bot": bot}
+    if avatar:
+        fields["author_avatar"] = avatar
+    return fields
+
+
+def _assignee_avatars(rows: Any) -> dict[str, str]:
+    """``{login: avatar}`` for the assignees that have an allow-listed avatar."""
+    out: dict[str, str] = {}
+    for row in rows if isinstance(rows, list) else []:
+        login, avatar, _bot = _actor(row)
+        if login and avatar:
+            out[login] = avatar
+    return out
 
 
 def _names(rows: Any, key: str) -> list[str]:
@@ -266,7 +376,8 @@ class _GitError(RuntimeError):
 # The codes the Desktop half maps to one quiet line. "ok" is the success code,
 # so every GitHub or repo payload carries the same four fields.
 FAILURE_CODES = frozenset({"folder_missing", "not_a_repo", "no_remote", "repo_not_found",
-                           "no_auth", "rate_limited", "network", "upstream_error"})
+                           "no_auth", "rate_limited", "network", "upstream_error",
+                           "empty_repo", "bad_sha"})
 
 # The codes a write route answers with. A write names its own failure in one
 # sentence and never raises: shell level exit codes and HTTP statuses both become
@@ -552,6 +663,543 @@ async def _repo_payload(folder: Path, root: Optional[str], error: Optional[str])
     if isinstance(ahead_behind, tuple):
         payload["ahead"], payload["behind"] = ahead_behind
     return payload
+
+
+# --- git history: graph and commit diff -------------------------------------
+
+# A graph payload carries up to 500 commits, so it lives in its own small LRU
+# instead of _CACHE: one 500 row window would otherwise flush the 256 GitHub
+# entries the board reads on every refresh. Diffs are immutable but large, so
+# they get a third, smaller cache with a longer TTL.
+GRAPH_TTL = 300.0
+COMMIT_TTL = 600.0
+GRAPH_MIN_LIMIT = 50
+GRAPH_MAX_LIMIT = 500
+GRAPH_TIMEOUT = 10.0
+COMMIT_TIMEOUT = 15.0
+DIFF_MAX_BYTES = 512 * 1024
+DIFF_MAX_LINES = 6000
+DIFF_MAX_FILES = 300
+MAX_GRAPH_ENTRIES = 32
+MAX_DIFF_ENTRIES = 24
+
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
+
+_LOG_FORMAT = "%H%x1f%P%x1f%aN%x1f%aE%x1f%aI%x1f%cI%x1f%s"
+_GRAPH_REF_FORMAT = "\x1f".join((
+    "%(refname)", "%(objectname)", "%(*objectname)", "%(upstream:short)",
+    "%(upstream:track,nobracket)", "%(HEAD)", "%(symref)",
+))
+
+_GRAPH_CACHE: "OrderedDict[tuple[Any, ...], tuple[float, dict[str, Any]]]" = OrderedDict()
+_DIFF_CACHE: "OrderedDict[tuple[str, str], tuple[float, dict[str, Any]]]" = OrderedDict()
+_GRAPH_LOCKS: dict[tuple[str, int], tuple[Any, asyncio.Lock]] = {}
+
+
+def _lru_get(cache: Any, key: tuple[Any, ...]) -> Optional[dict[str, Any]]:
+    """The cached payload with ``cached: True``, or None once its TTL passed."""
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    expires, payload = entry
+    if expires < time.monotonic():
+        cache.pop(key, None)
+        return None
+    cache.move_to_end(key)
+    return {**payload, "cached": True}
+
+
+def _lru_put(cache: Any, key: tuple[Any, ...], payload: dict[str, Any], *,
+             ttl: float, size: int) -> None:
+    cache[key] = (time.monotonic() + ttl, payload)
+    cache.move_to_end(key)
+    while len(cache) > size:
+        cache.popitem(last=False)
+
+
+def _graph_lock(key: tuple[str, int]) -> asyncio.Lock:
+    """One lock per (root, limit) on the running loop, so two misses read once."""
+    loop = asyncio.get_running_loop()
+    entry = _GRAPH_LOCKS.get(key)
+    if entry is None or entry[0] is not loop:
+        entry = (loop, asyncio.Lock())
+        _GRAPH_LOCKS[key] = entry
+    return entry[1]
+
+
+async def _run_capped(argv: Sequence[str], *, max_bytes: int,
+                      timeout: float) -> tuple[int, str, bool]:
+    """Run argv with no shell, stop reading at *max_bytes* and kill the child.
+
+    ``truncated`` says the output was cut, which also means the exit code is the
+    kill signal and not a git answer. A 2 MB patch therefore costs 512 KiB and
+    the route does not wait for the rest of a file nobody will render.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, env=_child_env(),
+    )
+    chunks: list[bytes] = []
+    total = 0
+    truncated = False
+
+    def stop() -> None:
+        try:
+            if proc.returncode is None:
+                proc.kill()
+        except ProcessLookupError:
+            pass
+
+    async def read_stdout() -> None:
+        nonlocal total, truncated
+        assert proc.stdout is not None
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                return
+            room = max_bytes - total
+            if len(chunk) > room:
+                if room > 0:
+                    chunks.append(chunk[:room])
+                    total += room
+                truncated = True
+                stop()
+                return
+            chunks.append(chunk)
+            total += len(chunk)
+
+    async def read_stderr() -> None:
+        assert proc.stderr is not None
+        while await proc.stderr.read(8192):
+            pass
+
+    try:
+        await asyncio.wait_for(asyncio.gather(read_stdout(), read_stderr()), timeout)
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        stop()
+        await proc.wait()
+        raise TimeoutError(f"{Path(argv[0]).name} timed out after {timeout:.0f}s") from exc
+    await proc.wait()
+    return proc.returncode, b"".join(chunks).decode("utf-8", "replace"), truncated
+
+
+async def _history_root(folder: Path) -> tuple[Optional[str], str, Optional[str], Optional[str]]:
+    """The work tree top level for a folder, or the code that explains why not.
+
+    ``_work_tree`` treats every git failure as "not a repo"; this one keeps git's
+    sentence, so "dubious ownership" is not reported as a folder outside git.
+    """
+    code, out, err = await _run(["git", "-C", str(folder), "rev-parse", "--show-toplevel"],
+                                timeout=GIT_TIMEOUT)
+    if code == 0 and out.strip():
+        return out.strip(), "ok", None, None
+    text = err.strip()
+    if "not a git repository" in text.lower():
+        return (None, "not_a_repo", f"{folder} is not inside a git work tree.",
+                f"git -C {folder} rev-parse --show-toplevel")
+    return (None, "upstream_error", f"Git could not read {folder}.",
+            text or f"git rev-parse exited {code}")
+
+
+async def _graph_probe(root: str) -> tuple[Optional[str], Optional[str], str, str]:
+    """Three cheap reads every call: (head sha, branch ref, fingerprint, refs).
+
+    Refs and HEAD are the whole input to the graph, so the same three answers
+    mean the same graph and the expensive log is not read again.
+    """
+    refs, head, sym = await asyncio.gather(
+        _run(["git", "-C", root, "for-each-ref", "--format=%(objectname) %(refname)",
+              "refs/heads", "refs/remotes", "refs/tags"], timeout=GIT_TIMEOUT),
+        _run(["git", "-C", root, "rev-parse", "--verify", "--quiet", "HEAD"],
+             timeout=GIT_TIMEOUT),
+        _run(["git", "-C", root, "symbolic-ref", "--quiet", "HEAD"], timeout=GIT_TIMEOUT),
+    )
+    ref_code, ref_out, ref_err = refs
+    if ref_code != 0:
+        raise _GitError(ref_err.strip() or f"git for-each-ref exited {ref_code}")
+    head_code, head_out, _ = head
+    sym_code, sym_out, _ = sym
+    head_sha = (head_out.strip() or None) if head_code == 0 else None
+    branch = (sym_out.strip() or None) if sym_code == 0 else None
+    digest = hashlib.sha256(
+        "\0".join((ref_out, head_sha or "", branch or "")).encode("utf-8")).hexdigest()
+    return head_sha, branch, digest[:16], ref_out
+
+
+def _parse_graph_log(text: str, limit: int,
+                     head_sha: Optional[str]) -> tuple[list[dict[str, Any]], bool]:
+    """Records are NUL separated, so a subject with a newline cannot split one."""
+    records = [record for record in text.split("\0") if record.strip()]
+    truncated = len(records) > limit
+    commits: list[dict[str, Any]] = []
+    for record in records[:limit]:
+        parts = record.split("\x1f", 6)
+        if len(parts) != 7 or not re.fullmatch(r"[0-9a-f]{40}", parts[0]):
+            continue
+        commits.append({
+            "sha": parts[0], "short": parts[0][:7],
+            "parents": parts[1].split() if parts[1] else [],
+            "author": {"name": parts[2], "email": parts[3]},
+            "authored_at": parts[4], "committed_at": parts[5],
+            "subject": parts[6], "is_head": parts[0] == head_sha,
+        })
+    return commits, truncated
+
+
+def _graph_refs(text: str, window: set[str]) -> tuple[list[dict[str, Any]], int, Optional[str]]:
+    """Refs whose peeled sha is in the window, plus the default branch symref."""
+    refs: list[dict[str, Any]] = []
+    outside = 0
+    default_branch: Optional[str] = None
+    for line in text.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 7:
+            continue
+        name, obj, peeled, upstream, track, head_mark, symref = parts
+        if symref:
+            # refs/remotes/<remote>/HEAD names the default branch; it is not a pill.
+            if name.startswith("refs/remotes/") and name.endswith("/HEAD"):
+                default_branch = (symref[len("refs/remotes/"):]
+                                  if symref.startswith("refs/remotes/") else symref)
+            continue
+        sha = peeled or obj
+        if name.startswith("refs/heads/"):
+            kind, short = "local", name[len("refs/heads/"):]
+        elif name.startswith("refs/remotes/"):
+            kind, short = "remote", name[len("refs/remotes/"):]
+        elif name.startswith("refs/tags/"):
+            kind, short = "tag", name[len("refs/tags/"):]
+        else:
+            continue
+        if sha not in window:
+            outside += 1
+            continue
+        ahead, behind = _track(track)
+        refs.append({
+            "name": name, "short": short, "kind": kind, "sha": sha,
+            "upstream": upstream or None, "ahead": ahead, "behind": behind,
+            "gone": (track or "").strip() == "gone",
+            "is_head": head_mark.strip() == "*", "is_remote": kind == "remote",
+        })
+    return refs, outside, default_branch
+
+
+async def _graph_read(root: str, limit: int, head_sha: Optional[str],
+                      branch_ref: Optional[str], fingerprint: str) -> dict[str, Any]:
+    log_args = ["git", "-C", root, "-c", "log.showSignature=false",
+                "-c", "i18n.logOutputEncoding=UTF-8", "log", "--date-order",
+                "--no-color", "--no-decorate", "-z", "-n", str(limit + 1),
+                f"--format={_LOG_FORMAT}", "--branches", "--remotes"]
+    if head_sha:
+        log_args.append("HEAD")
+    log_args.append("--")
+    ref_args = ["git", "-C", root, "for-each-ref", f"--format={_GRAPH_REF_FORMAT}",
+                "refs/heads", "refs/remotes", "refs/tags"]
+    log, refs = await asyncio.gather(_run(log_args, timeout=GRAPH_TIMEOUT),
+                                     _run(ref_args, timeout=GRAPH_TIMEOUT))
+    log_code, log_out, log_err = log
+    ref_code, ref_out, ref_err = refs
+    if log_code != 0:
+        raise _GitError(log_err.strip() or f"git log exited {log_code}")
+    if ref_code != 0:
+        raise _GitError(ref_err.strip() or f"git for-each-ref exited {ref_code}")
+    commits, truncated = _parse_graph_log(log_out, limit, head_sha)
+    window = {commit["sha"] for commit in commits}
+    ref_rows, outside, default_branch = _graph_refs(ref_out, window)
+    branch = (branch_ref[len("refs/heads/"):]
+              if branch_ref and branch_ref.startswith("refs/heads/") else branch_ref)
+    return {
+        "ok": True, "code": "ok", "error": None, "detail": None, "cached": False,
+        "root": root, "fingerprint": fingerprint, "limit": limit, "truncated": truncated,
+        "head": {"sha": head_sha, "branch": branch,
+                 "detached": bool(head_sha and not branch_ref)},
+        "default_branch": default_branch,
+        "commits": commits, "refs": ref_rows, "refs_outside": outside,
+    }
+
+
+def _graph_failure(path: str, code: str, error: str, detail: Optional[str], *,
+                   limit: int = 200, root: Optional[str] = None) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": error, "detail": detail, "cached": False,
+            "path": path, "root": root, "fingerprint": None, "limit": limit,
+            "truncated": False, "head": {"sha": None, "branch": None, "detached": False},
+            "default_branch": None, "commits": [], "refs": [], "refs_outside": 0}
+
+
+def _commit_failure(sha: str, code: str, error: str, detail: Optional[str]) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": error, "detail": detail, "cached": False,
+            "sha": sha, "short": sha[:7], "parents": [], "author": None,
+            "authored_at": None, "committer": None, "committed_at": None,
+            "subject": None, "body": None, "diff_base": None, "on_remote": False,
+            "stats": {"files": 0, "additions": 0, "deletions": 0}, "files": [],
+            "truncated": False, "truncated_reason": None}
+
+
+def _parse_numstat(text: str) -> list[dict[str, Any]]:
+    """numstat -z: ``add<TAB>del<TAB>path<NUL>`` or ``add<TAB>del<TAB><NUL>old<NUL>new<NUL>``."""
+    tokens = text.split("\0")
+    rows: list[dict[str, Any]] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index].lstrip("\n")
+        index += 1
+        if not token:
+            continue
+        fields = token.split("\t")
+        if len(fields) < 2:
+            continue
+        added, deleted = fields[0], fields[1]
+        path = "\t".join(fields[2:]) if len(fields) > 2 else ""
+        old_path: Optional[str] = None
+        rename = False
+        if not path:
+            if index + 1 >= len(tokens):
+                break
+            old_path = tokens[index].lstrip("\n")
+            path = tokens[index + 1]
+            index += 2
+            rename = True
+        binary = added == "-" and deleted == "-"
+        rows.append({
+            "path": path, "old_path": old_path,
+            "additions": 0 if binary else _int(added),
+            "deletions": 0 if binary else _int(deleted),
+            "binary": binary, "rename": rename,
+        })
+    return rows
+
+
+def _patch_path(value: str) -> Optional[str]:
+    if value == "/dev/null":
+        return None
+    if value.startswith("a/") or value.startswith("b/"):
+        return value[2:]
+    return value
+
+
+def _parse_patch(text: str) -> tuple[dict[str, dict[str, Any]], bool, Optional[str]]:
+    """Diff blocks by path, whether the line cap cut the read, and the last path.
+
+    Headers are only read before a file's first hunk, because a removed line can
+    itself start with ``--- ``, ``+++ `` or ``diff --git``.
+    """
+    blocks: list[dict[str, Any]] = []
+    current: Optional[dict[str, Any]] = None
+    hunk: Optional[dict[str, Any]] = None
+    seen_hunk = False
+    line_cut = False
+    for count, line in enumerate(text.splitlines()):
+        if count >= DIFF_MAX_LINES:
+            line_cut = True
+            break
+        if line.startswith("diff --git "):
+            current = {"path": None, "old_path": None, "status": "M",
+                       "old_mode": None, "new_mode": None, "binary": False, "hunks": []}
+            blocks.append(current)
+            hunk = None
+            seen_hunk = False
+            continue
+        if current is None:
+            continue
+        if hunk is not None:
+            op = line[:1]
+            if op in (" ", "+", "-"):
+                hunk["lines"].append([op, line[1:]])
+                continue
+            if op == "\\":
+                hunk["lines"].append(["\\", line[2:] if line[1:2] == " " else line[1:]])
+                continue
+            hunk = None
+        if line.startswith("@@"):
+            match = _HUNK_RE.match(line)
+            if match is None:
+                continue
+            hunk = {"header": line, "old_start": int(match.group(1)),
+                    "old_lines": int(match.group(2) or 1),
+                    "new_start": int(match.group(3)),
+                    "new_lines": int(match.group(4) or 1), "lines": []}
+            current["hunks"].append(hunk)
+            seen_hunk = True
+            continue
+        if seen_hunk:
+            continue
+        if line.startswith("old mode "):
+            current["old_mode"] = line[len("old mode "):]
+        elif line.startswith("new mode "):
+            current["new_mode"] = line[len("new mode "):]
+        elif line.startswith("new file mode "):
+            current["status"] = "A"
+        elif line.startswith("deleted file mode "):
+            current["status"] = "D"
+        elif line.startswith("rename from "):
+            current["status"] = "R"
+            current["old_path"] = line[len("rename from "):]
+        elif line.startswith("rename to "):
+            current["path"] = line[len("rename to "):]
+        elif line.startswith("copy from "):
+            current["status"] = "C"
+            current["old_path"] = line[len("copy from "):]
+        elif line.startswith("copy to "):
+            current["path"] = line[len("copy to "):]
+        elif line.startswith("--- "):
+            current["old_path"] = _patch_path(line[4:])
+        elif line.startswith("+++ "):
+            path = _patch_path(line[4:])
+            if path is None:
+                current["path"] = current["old_path"]
+                if current["status"] == "M":
+                    current["status"] = "D"
+            else:
+                current["path"] = path
+        elif line.startswith("Binary files "):
+            current["binary"] = True
+            match = re.match(r"^Binary files (.*) and (.*) differ$", line)
+            if match:
+                old = _patch_path(match.group(1))
+                new = _patch_path(match.group(2))
+                if old:
+                    current["old_path"] = old
+                current["path"] = new or old
+    by_path: dict[str, dict[str, Any]] = {}
+    last_path: Optional[str] = None
+    for block in blocks:
+        if (block["status"] == "M" and block["old_mode"] and block["new_mode"]
+                and block["old_mode"][:3] != block["new_mode"][:3]):
+            block["status"] = "T"
+        path = block["path"] or block["old_path"]
+        if path:
+            prior = by_path.get(path)
+            if prior is not None and {prior["status"], block["status"]} == {"A", "D"}:
+                # A mode change renders as a delete and a create of one path.
+                block["status"] = "T"
+                block["hunks"] = prior["hunks"] + block["hunks"]
+            by_path[path] = block
+            last_path = path
+    return by_path, line_cut, last_path
+
+
+def _show_argv(root: str, full: str, *, numstat: bool, legacy: bool) -> list[str]:
+    argv = ["git", "-C", root, "-c", "core.quotePath=false", "show",
+            "--no-ext-diff", "--no-textconv", "--no-color", "--no-show-signature",
+            "--format="]
+    if numstat:
+        argv += ["--numstat", "-z", "-M"]
+    else:
+        argv += ["--patch", "-M", "--unified=3"]
+    if legacy:
+        argv += ["-m", "--first-parent"]
+    else:
+        argv += ["--diff-merges=first-parent"]
+    return argv + [full, "--"]
+
+
+def _needs_legacy(err: str) -> bool:
+    text = (err or "").lower()
+    return "diff-merges" in text or "unknown option" in text or "unrecognized option" in text
+
+
+def _commit_payload(root: str, meta: str, numstat: str, patch: str, patch_cut: bool,
+                    on_remote: bool) -> dict[str, Any]:
+    fields = meta.split("\x1f", 8)
+    if len(fields) != 9:
+        raise _GitError("git show returned an unexpected commit header")
+    (sha, parents_raw, author_name, author_email, authored_at, committer_name,
+     committer_email, committed_at, message) = fields
+    message = message.rstrip("\n")
+    subject, _, body = message.partition("\n")
+    rows = _parse_numstat(numstat)
+    blocks, line_cut, last_path = _parse_patch(patch)
+    files_cut = len(rows) > DIFF_MAX_FILES
+    out_files: list[dict[str, Any]] = []
+    for row in rows[:DIFF_MAX_FILES]:
+        block = blocks.get(row["path"])
+        if block is None and row["old_path"]:
+            block = blocks.get(row["old_path"])
+        status = block["status"] if block else ("R" if row["rename"] else "M")
+        old_path = (row["old_path"] if row["rename"]
+                    else block["old_path"] if block and status in ("R", "C") else None)
+        file_cut = bool(row["path"] == last_path and (patch_cut or line_cut))
+        if block is None and (patch_cut or line_cut) and not row["binary"]:
+            file_cut = True
+        out_files.append({
+            "path": row["path"],
+            "old_path": old_path,
+            "status": status,
+            "additions": row["additions"], "deletions": row["deletions"],
+            "binary": row["binary"], "truncated": file_cut,
+            "hunks": block["hunks"] if block else [],
+        })
+    reason = ("bytes" if patch_cut else "lines" if line_cut
+              else "files" if files_cut else None)
+    return {
+        "ok": True, "code": "ok", "error": None, "detail": None, "cached": False,
+        "root": root, "sha": sha, "short": sha[:7],
+        "parents": parents_raw.split() if parents_raw else [],
+        "author": {"name": author_name, "email": author_email}, "authored_at": authored_at,
+        "committer": {"name": committer_name, "email": committer_email},
+        "committed_at": committed_at, "subject": subject, "body": body.strip(),
+        "diff_base": "first_parent" if parents_raw else "root",
+        "on_remote": on_remote,
+        "stats": {"files": len(rows),
+                  "additions": sum(row["additions"] for row in rows),
+                  "deletions": sum(row["deletions"] for row in rows)},
+        "files": out_files,
+        "truncated": reason is not None, "truncated_reason": reason,
+    }
+
+
+async def _commit_read(root: str, full: str) -> dict[str, Any]:
+    meta_argv = ["git", "-C", root, "-c", "i18n.logOutputEncoding=UTF-8", "show", "-s",
+                 "--no-show-signature",
+                 "--format=%H%x1f%P%x1f%aN%x1f%aE%x1f%aI%x1f%cN%x1f%cE%x1f%cI%x1f%B",
+                 full, "--"]
+    remote_argv = ["git", "-C", root, "for-each-ref", "--contains", full, "--count=1",
+                   "--format=%(refname)", "refs/remotes"]
+    meta, numstat, patch, remote = await asyncio.gather(
+        _run(meta_argv, timeout=COMMIT_TIMEOUT),
+        _run(_show_argv(root, full, numstat=True, legacy=False), timeout=COMMIT_TIMEOUT),
+        _run_capped(_show_argv(root, full, numstat=False, legacy=False),
+                    max_bytes=DIFF_MAX_BYTES, timeout=COMMIT_TIMEOUT),
+        _run(remote_argv, timeout=GIT_TIMEOUT),
+        return_exceptions=True,
+    )
+    if isinstance(meta, BaseException):
+        raise _GitError(str(meta) or "git show failed")
+    meta_code, meta_out, meta_err = meta
+    if meta_code != 0:
+        raise _GitError(meta_err.strip() or f"git show exited {meta_code}")
+    if isinstance(numstat, BaseException):
+        raise _GitError(str(numstat) or "git show --numstat failed")
+    if isinstance(patch, BaseException):
+        raise _GitError(str(patch) or "git show --patch failed")
+
+    num_code, num_out, num_err = numstat
+    patch_code, patch_out, patch_cut = patch
+    if num_code != 0 or (patch_code != 0 and not patch_cut):
+        # git older than 2.31 does not know --diff-merges: retry once with -m.
+        num_retry, patch_retry = await asyncio.gather(
+            _run(_show_argv(root, full, numstat=True, legacy=True), timeout=COMMIT_TIMEOUT),
+            _run_capped(_show_argv(root, full, numstat=False, legacy=True),
+                        max_bytes=DIFF_MAX_BYTES, timeout=COMMIT_TIMEOUT),
+        )
+        retry_code, retry_out, retry_err = num_retry
+        if retry_code != 0:
+            raise _GitError(retry_err.strip() or num_err.strip()
+                            or f"git show exited {num_code}")
+        patch_code, patch_out, patch_cut = patch_retry
+        num_out = retry_out
+        if patch_code != 0 and not patch_cut:
+            raise _GitError(f"git show could not produce the diff for {full[:7]}")
+        if not _needs_legacy(num_err) and num_code != 0:
+            log.info("project-command-center: retried git show for %s after: %s",
+                     full[:7], num_err.strip())
+
+    on_remote = False
+    if not isinstance(remote, BaseException):
+        remote_code, remote_out, _ = remote
+        on_remote = remote_code == 0 and bool(remote_out.strip())
+    return _commit_payload(root, meta_out, num_out, patch_out, patch_cut, on_remote)
 
 
 # --- GitHub client ----------------------------------------------------------
@@ -995,8 +1643,8 @@ def _pr_query(owner: str, repo: str, numbers: Sequence[int]) -> tuple[str, dict[
 
 _REF_FIELDS = """
   __typename
-  ... on Issue { number title state url updatedAt author { login } }
-  ... on PullRequest { number title state url updatedAt author { login } }
+  ... on Issue { number title state stateReason url updatedAt author { __typename login avatarUrl(size: 48) } }
+  ... on PullRequest { number title state isDraft merged url updatedAt author { __typename login avatarUrl(size: 48) } }
 """
 
 
@@ -1094,18 +1742,29 @@ def _checks(node: Optional[Mapping[str, Any]]) -> Checks:
 
 
 def _issue_row(raw: Mapping[str, Any]) -> IssueRow:
-    return {
+    assignee_avatars = _assignee_avatars(raw.get("assignees"))
+    login, avatar, bot = _actor(raw.get("user"))
+    row: IssueRow = {
         "number": _int(raw.get("number")),
         "title": str(raw.get("title") or ""),
         "state": str(raw.get("state") or "open"),
+        # completed | not_planned | duplicate | reopened as GitHub reports it, so
+        # a closed row can be coloured and filtered without a second read.
+        "state_reason": raw.get("state_reason"),
         "url": raw.get("html_url"),
-        "author": _login(raw.get("user")),
+        "author": login,
+        "author_bot": bot,
         "labels": _names(raw.get("labels"), "name"),
         "assignees": _names(raw.get("assignees"), "login"),
         "comments": _int(raw.get("comments")),
         "updated_at": raw.get("updated_at"),
         "created_at": raw.get("created_at"),
     }
+    if avatar:
+        row["author_avatar"] = avatar
+    if assignee_avatars:
+        row["assignee_avatars"] = assignee_avatars
+    return row
 
 
 def _pull_row(raw: Mapping[str, Any], node: Optional[Mapping[str, Any]]) -> PullRow:
@@ -1118,14 +1777,16 @@ def _pull_row(raw: Mapping[str, Any], node: Optional[Mapping[str, Any]]) -> Pull
     head = raw.get("head") if isinstance(raw.get("head"), dict) else {}
     base = raw.get("base") if isinstance(raw.get("base"), dict) else {}
     merge_state = str(node.get("mergeStateStatus") or "").upper()
-    return {
+    login, avatar, bot = _actor(raw.get("user"))
+    row: PullRow = {
         "number": _int(raw.get("number")),
         "title": title,
         "state": str(raw.get("state") or node.get("state") or "open").lower(),
         "draft": bool(raw.get("draft")) or bool(node.get("isDraft")),
         "merged": bool(raw.get("merged_at") or node.get("mergedAt")),
         "url": raw.get("html_url"),
-        "author": _login(raw.get("user")),
+        "author": login,
+        "author_bot": bot,
         "head_ref": str(head.get("ref") or node.get("headRefName") or ""),
         "base_ref": str(base.get("ref") or node.get("baseRefName") or ""),
         "updated_at": raw.get("updated_at"),
@@ -1140,6 +1801,9 @@ def _pull_row(raw: Mapping[str, Any], node: Optional[Mapping[str, Any]]) -> Pull
             raw.get("mergeable_state") or merge_state.lower() or "unknown"),
         "enriched": bool(node),
     }
+    if avatar:
+        row["author_avatar"] = avatar
+    return row
 
 
 def _comment_rows(rows: Any) -> list[CommentRow]:
@@ -1153,14 +1817,19 @@ def _comment_rows(rows: Any) -> list[CommentRow]:
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
             continue
-        out.append({
+        login, avatar, bot = _actor(row.get("user"))
+        entry: CommentRow = {
             "id": _int(row.get("id")),
-            "author": _login(row.get("user")),
+            "author": login,
+            "author_bot": bot,
             "body": str(row.get("body") or ""),
             "created_at": row.get("created_at"),
             "updated_at": row.get("updated_at"),
             "url": row.get("html_url"),
-        })
+        }
+        if avatar:
+            entry["author_avatar"] = avatar
+        out.append(entry)
     return out[:MAX_COMMENTS]
 
 
@@ -1170,12 +1839,17 @@ def _review_rows(rows: Any) -> list[ReviewRow]:
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict) or not row.get("submitted_at"):
             continue
-        out.append({
-            "author": _login(row.get("user")),
+        login, avatar, bot = _actor(row.get("user"))
+        entry: ReviewRow = {
+            "author": login,
+            "author_bot": bot,
             "state": row.get("state"),
             "body": str(row.get("body") or ""),
             "submitted_at": row.get("submitted_at"),
-        })
+        }
+        if avatar:
+            entry["author_avatar"] = avatar
+        out.append(entry)
     return out
 
 
@@ -1197,6 +1871,37 @@ def _counts(issues: Sequence[IssueRow], pulls: Sequence[PullRow]) -> Counts:
         "approved": sum(1 for p in judged if p["review_decision"] == "APPROVED"),
         "checks_failing": sum(1 for p in judged if p["checks"]["state"] == "failure"),
     }
+
+
+def _state_sort(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Newest first, de-duplicated by number: one list built from two reads."""
+    seen: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for row in sorted(rows, key=lambda r: str(r.get("updated_at") or ""), reverse=True):
+        number = _int(row.get("number"))
+        if number in seen:
+            continue
+        seen.add(number)
+        out.append(row)
+    return out
+
+
+def _cap_states(rows: Sequence[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Up to ``limit`` open and up to ``limit`` closed rows, in the order given.
+
+    ``state=all`` must not let a busy closed history push every open row out of
+    the window: the default (open) view keeps exactly the rows a plain
+    ``state=open`` read returns, and the closed half is capped on its own.
+    """
+    counts = {"open": 0, "closed": 0}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        bucket = "open" if str(row.get("state") or "open").lower() == "open" else "closed"
+        if counts[bucket] >= limit:
+            continue
+        counts[bucket] += 1
+        out.append(row)
+    return out
 
 
 def _empty_board(*, owner: Optional[str] = None, repo: Optional[str] = None,
@@ -1476,7 +2181,7 @@ async def _post_comment(number: int, path: str, payload: Mapping[str, Any],
     raw = data if isinstance(data, dict) else {}
     return {"ok": True, "comment": {
         "id": _int(raw.get("id")),
-        "author": _login(raw.get("user")),
+        **_actor_fields(raw.get("user")),
         "body": str(raw.get("body") or text),
         "created_at": raw.get("created_at"),
     }}
@@ -1518,10 +2223,13 @@ async def _set_state(number: int, path: str, payload: Mapping[str, Any],
 # fixed list of candidate paths, a magic byte sniff (never the extension), then a
 # narrow remote fallback, then a stack key the Desktop maps to a glyph.
 #
-# Local is deliberately not a tree walk. The sibling DMS plugin walks the whole
-# project looking for an image; on a node_modules sized folder that is seconds of
-# syscalls per card. Here every path is built from ICON_ROOTS x ICON_NAMES, so the
-# worst case is 13 * 7 stats and nothing is entered recursively.
+# Local is a fixed list first, then one small bounded walk. The fixed list keeps
+# absolute priority: root files, then the usual public/static/app roots, 91 stats
+# and no recursion. Only when none of those holds an image does a second step
+# look for a ``public`` directory below the project root (a Vite playground, an
+# apps/web layout), at most 3 levels down, 64 directories and 400 entries read,
+# and never inside another repository. The walk runs in a worker thread; the
+# cache stays on the event loop.
 
 ICON_TTL = 300.0
 ICON_REMOTE_TTL = 3600.0
@@ -1537,6 +2245,20 @@ ICON_NAMES = ("favicon.svg", "favicon.png", "favicon.ico", "logo.svg", "logo.png
               "icon.png", "app-icon.png")
 # One level down, for a Laravel app whose front end is a sibling folder.
 ICON_FRONTEND_DIRS = ("frontend", "web", "client", "apps", "ui")
+# The second local step: a bounded search for ``public`` directories.
+ICON_PUBLIC_MAX_DEPTH = 3
+ICON_WALK_MAX_DIRS = 64
+ICON_WALK_MAX_ENTRIES = 400
+ICON_PUBLIC_MAX = 8
+ICON_PREFERRED_PARENTS = ("playground", "app", "web", "frontend", "packages")
+ICON_SKIP_DIRS = frozenset({
+    "node_modules", "vendor", "dist", "build", "out", ".output", ".nuxt", ".next",
+    ".svelte-kit", "target", "venv", "__pycache__", "coverage", "storage", "result",
+    "cache", "tmp",
+})
+# In the second step only: a package's own mark is often named after it.
+ICON_SUFFIX_NAMES = ("-logo", "-favicon")
+ICON_SUFFIX_EXTS = ("svg", "png", "ico")
 ICON_KILL_FILENAME = "icons_remote.off"
 ICON_UA = (f"project-command-center/{PLUGIN_VERSION} "
            "(+https://github.com/NyllRE/project-command-center)")
@@ -1575,7 +2297,7 @@ def _icon_label(root: str, name: str) -> str:
 
 
 def _icon_paths(folder: Path):
-    """The whole candidate space: fixed roots, fixed names, in priority order."""
+    """The fixed candidate space: fixed roots, fixed names, in priority order."""
     for root in ICON_ROOTS:
         if len(Path(root).parts) > ICON_MAX_ROOT_DEPTH:
             continue
@@ -1588,37 +2310,185 @@ def _icon_data_url(data: bytes, mime: str) -> str:
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def _icon_local(folder: Path, *, refresh: bool) -> Optional[dict[str, Any]]:
-    """First local candidate that sniffs as an image, keyed by its own mtime.
+def _icon_walk_order(depth: int, path: Path) -> tuple[int, int, str]:
+    """Queue order: depth, then a preferred directory name, then the path."""
+    name = path.name.lower()
+    try:
+        rank = ICON_PREFERRED_PARENTS.index(name)
+    except ValueError:
+        rank = len(ICON_PREFERRED_PARENTS)
+    return (depth, rank, str(path))
 
-    A negative answer is cached too (``icon-local-miss``) so a project with no
-    image does not cost 91 stats on every card render; both expire in 300 s and
-    ``refresh=1`` bypasses them.
+
+def _icon_rel(folder: Path, path: Path) -> str:
+    try:
+        return path.relative_to(folder).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _icon_public_dirs(folder: Path) -> list[Path]:
+    """``public`` directories below *folder*, bounded and never inside a repo.
+
+    Breadth first with a hard budget of 64 scanned directories and 400 entries.
+    Hidden directories, symlinks, build and dependency folders, and any
+    directory that holds a ``.git`` are skipped: a nested checkout is another
+    project, not part of this one. The root ``public`` is left out because the
+    fixed list already tests it first.
     """
-    miss_key = ("icon-local-miss", str(folder))
-    if not refresh and _cache_hit(miss_key) is not None:
-        return None
-    for path, label in _icon_paths(folder):
+    found: list[Path] = []
+    queue: list[tuple[Path, int]] = [(folder, 0)]
+    visited = entries = 0
+    while queue and visited < ICON_WALK_MAX_DIRS and len(found) < ICON_PUBLIC_MAX:
+        queue.sort(key=lambda item: _icon_walk_order(item[1], item[0]))
+        current, depth = queue.pop(0)
+        if depth >= ICON_PUBLIC_MAX_DEPTH:
+            continue
+        visited += 1
+        try:
+            with os.scandir(current) as scan:
+                for entry in scan:
+                    if entries >= ICON_WALK_MAX_ENTRIES:
+                        break
+                    entries += 1
+                    name = entry.name
+                    if name.startswith(".") or name in ICON_SKIP_DIRS:
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    child = Path(entry.path)
+                    if (child / ".git").exists():
+                        continue
+                    if name == "public":
+                        if depth + 1 > 1:
+                            found.append(child)
+                        continue
+                    if depth + 1 < ICON_PUBLIC_MAX_DEPTH:
+                        queue.append((child, depth + 1))
+        except OSError:
+            continue
+    return found
+
+
+def _icon_public_order(folder: Path, path: Path) -> tuple[int, int, str]:
+    """Shallowest first, then the preferred parent, then the path alphabetically."""
+    rel = _icon_rel(folder, path)
+    parts = Path(rel).parts
+    parent = parts[-2].lower() if len(parts) > 1 else ""
+    try:
+        rank = ICON_PREFERRED_PARENTS.index(parent)
+    except ValueError:
+        rank = len(ICON_PREFERRED_PARENTS)
+    return (len(parts), rank, rel)
+
+
+def _icon_suffix_names(directory: Path) -> list[str]:
+    """``*-logo`` and ``*-favicon`` images already listed in one public folder."""
+    names: list[str] = []
+    try:
+        with os.scandir(directory) as scan:
+            for entry in scan:
+                if len(names) >= ICON_PUBLIC_MAX:
+                    break
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                stem, dot, ext = entry.name.rpartition(".")
+                if not dot or ext.lower() not in ICON_SUFFIX_EXTS:
+                    continue
+                if stem.lower().endswith(ICON_SUFFIX_NAMES):
+                    names.append(entry.name)
+    except OSError:
+        return []
+    return sorted(names)
+
+
+def _icon_scan(folder: Path, public_dirs: Sequence[str]) -> list[tuple[str, str, int]]:
+    """Every candidate file that exists, in priority order: (path, label, mtime).
+
+    Runs in a worker thread and touches only the filesystem: the cache is read
+    and written by the event loop, never here.
+    """
+    candidates: list[tuple[Path, str]] = list(_icon_paths(folder))
+    for text in public_dirs:
+        base = Path(text)
+        for name in ICON_NAMES:
+            path = base / name
+            candidates.append((path, _icon_rel(folder, path)))
+        for name in _icon_suffix_names(base):
+            path = base / name
+            candidates.append((path, _icon_rel(folder, path)))
+    out: list[tuple[str, str, int]] = []
+    seen: set[str] = set()
+    for path, label in candidates:
+        text = str(path)
+        if text in seen:
+            continue
+        seen.add(text)
         try:
             stat = path.stat()
         except OSError:
             continue
-        if not stat.st_size or stat.st_size > ICON_MAX_BYTES or not path.is_file():
+        if not stat.st_size or stat.st_size > ICON_MAX_BYTES:
             continue
-        key = ("icon-local", str(folder), str(path), stat.st_mtime_ns)
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            continue
+        out.append((text, label, stat.st_mtime_ns))
+    return out
+
+
+async def _icon_local(folder: Path, *, refresh: bool) -> Optional[dict[str, Any]]:
+    """First local candidate that sniffs as an image, keyed by its own mtime.
+
+    The fixed list is scanned first and the ``public`` walk second, so a root
+    file always wins. Disk work happens in a worker thread; both the per-file
+    cache and the negative cache are read and written here, and the discovered
+    ``public`` folder list is cached for 300 s under ``icon-dirs``. ``refresh=1``
+    bypasses all of them.
+    """
+    miss_key = ("icon-local-miss", str(folder))
+    if refresh:
+        # A refresh after a miss must not leave the old miss behind: otherwise
+        # the next ordinary read would answer the glyph for another 300 s.
+        _CACHE.pop(miss_key, None)
+    elif _cache_hit(miss_key) is not None:
+        return None
+
+    dirs: list[str] = []
+    dirs_key = ("icon-dirs", str(folder))
+    cached_dirs = None if refresh else _cache_hit(dirs_key)
+    if cached_dirs is not None and isinstance(cached_dirs.get("dirs"), list):
+        dirs = [str(item) for item in cached_dirs["dirs"]]
+    else:
+        found = await asyncio.to_thread(_icon_public_dirs, folder)
+        found.sort(key=lambda path: _icon_public_order(folder, path))
+        dirs = [str(path) for path in found]
+        _cache_put(dirs_key, {"dirs": dirs}, ttl=ICON_TTL)
+
+    scanned = await asyncio.to_thread(_icon_scan, folder, dirs)
+    for text, label, mtime in scanned:
+        key = ("icon-local", str(folder), text, mtime)
         if not refresh:
             cached = _cache_hit(key)
             if cached is not None:
                 return cached
         try:
-            data = path.read_bytes()
+            data = await asyncio.to_thread(Path(text).read_bytes)
         except OSError:
             continue
         if len(data) > ICON_MAX_BYTES:
             continue
         mime = _icon_mime(data)
         if mime is None:
-            log.debug("icon: %s is not an image, next candidate", path)
+            log.debug("icon: %s is not an image, next candidate", text)
             continue
         payload = {"ok": True, "kind": "image", "data_url": _icon_data_url(data, mime),
                    "mime": mime, "source": "local", "detail": label}
@@ -1885,7 +2755,7 @@ async def _icon_remote(folder: Path, *, refresh: bool) -> Optional[dict[str, Any
 
 async def _icon_answer(folder: Path, *, refresh: bool) -> dict[str, Any]:
     """Local image, else remote image, else the stack glyph. Never raises for a folder."""
-    local = _icon_local(folder, refresh=refresh)
+    local = await _icon_local(folder, refresh=refresh)
     if local is not None:
         return local
     glyph_key = ("icon-glyph", str(folder))
@@ -1900,6 +2770,206 @@ async def _icon_answer(folder: Path, *, refresh: bool) -> dict[str, Any]:
     payload = {"ok": True, "kind": "glyph", "stack": _icon_stack(folder), "source": "stack"}
     _cache_put(glyph_key, payload, ttl=ICON_TTL)
     return payload
+
+
+# --- Branch switch -----------------------------------------------------------
+#
+# The one route that runs a mutating git command. It refuses every state where a
+# switch would lose work or surprise another checkout, and it never stashes,
+# never discards and never forces. The branch name is validated by git itself
+# and must resolve to an existing ref before it reaches `git switch`; the folder
+# is untrusted input like every other path here.
+
+_SWITCH_MARKERS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG",
+                   "rebase-merge", "rebase-apply", "sequencer")
+
+
+def _switch_refusal(code: str, error: str, detail: Optional[str] = None,
+                    **extra: Any) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": error, "detail": detail, **extra}
+
+
+def _git_line(message: str) -> str:
+    for line in (message or "").splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return "git switch failed"
+
+
+def _worktree_rows(listing: str) -> list[tuple[str, str]]:
+    """(branch ref, worktree path) rows from ``git worktree list --porcelain``."""
+    rows: list[tuple[str, str]] = []
+    path: Optional[str] = None
+    for line in listing.splitlines():
+        if not line:
+            path = None
+        elif line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.startswith("branch ") and path:
+            rows.append((line[len("branch "):], path))
+    return rows
+
+
+async def _switch_operation(root: str) -> Optional[str]:
+    """The marker of an in-progress merge, rebase, cherry-pick, revert or bisect."""
+    argv = ["git", "-C", root, "rev-parse"]
+    for marker in _SWITCH_MARKERS:
+        argv += ["--git-path", marker]
+    code, out, _err = await _run(argv, timeout=GIT_TIMEOUT)
+    if code != 0:
+        return None
+    for marker, line in zip(_SWITCH_MARKERS, out.splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(root, candidate)
+        if os.path.exists(candidate):
+            return marker
+    return None
+
+
+async def _switch_head_on_a_branch(root: str) -> bool:
+    """True when HEAD is contained by at least one local or remote branch."""
+    code, out, _err = await _run(
+        ["git", "-C", root, "for-each-ref", "--count=1", "--contains", "HEAD",
+         "--format=%(refname)", "refs/heads", "refs/remotes"],
+        timeout=GIT_TIMEOUT)
+    return code == 0 and bool(out.strip())
+
+
+@router.post("/branch/switch")
+async def branch_switch(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Switch the main checkout to *branch*, behind guards, with a fixed argv.
+
+    ``{"path": folder, "branch": name}`` answers ``{"ok": true, "code":
+    "switched"|"already_on", ...}`` or ``{"ok": false, "code": ...}`` with one of
+    ``folder_missing``, ``not_a_repo``, ``inside_root``, ``not_main_worktree``,
+    ``operation_in_progress``, ``detached_unreachable``, ``dirty_tree``,
+    ``unknown_branch``, ``checked_out_elsewhere``, ``bad_branch``,
+    ``switch_failed`` or ``upstream_error``. Untracked files alone are allowed
+    and reported in ``warning``. HTTP 200 for every refusal; only a malformed
+    path is a 400.
+    """
+    branch = str(payload.get("branch") or "").strip()
+    raw_path = str(payload.get("path") or "").strip()
+    try:
+        folder = _resolve_folder(raw_path)
+    except _FolderMissing as exc:
+        return _switch_refusal("folder_missing", f"Folder not found: {exc.path}", exc.path)
+    if not branch:
+        return _switch_refusal("bad_branch", "The branch name is empty.")
+
+    try:
+        root = await _work_tree(folder)
+    except TimeoutError as exc:
+        return _switch_refusal("upstream_error", f"git did not answer for {folder}.",
+                               str(exc))
+    if not root:
+        return _switch_refusal("not_a_repo", f"{folder} is not inside a git work tree.",
+                               f"git -C {folder} rev-parse --show-toplevel")
+    if os.path.realpath(root) != str(folder):
+        return _switch_refusal("inside_root", f"{folder} is inside the repository at {root}.",
+                               root)
+
+    head: Optional[str] = None
+    previous_sha: Optional[str] = None
+    dirty = _dirty_from_status("")
+    local_code = 1
+    try:
+        code, _out, _err = await _run(
+            ["git", "-C", root, "check-ref-format", "--branch", branch], timeout=GIT_TIMEOUT)
+        if code != 0:
+            return _switch_refusal("bad_branch", "The branch name is not valid.")
+
+        git_dir = (await _git(root, "rev-parse", "--absolute-git-dir")).strip()
+        common_dir = (await _git(root, "rev-parse", "--git-common-dir")).strip()
+        if not os.path.isabs(common_dir):
+            common_dir = os.path.join(root, common_dir)
+        if os.path.realpath(git_dir) != os.path.realpath(common_dir):
+            return _switch_refusal(
+                "not_main_worktree",
+                "This folder is a linked worktree, not the main checkout.",
+                f"git dir {git_dir}, common dir {common_dir}")
+
+        marker = await _switch_operation(root)
+        if marker:
+            return _switch_refusal(
+                "operation_in_progress",
+                "A merge, rebase or other git operation is in progress.",
+                marker)
+
+        try:
+            head = (await _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")).strip()
+        except _GitError:
+            head = None
+        if not head:
+            previous_sha = (await _git(root, "rev-parse", "--short", "HEAD")).strip()
+            if not await _switch_head_on_a_branch(root):
+                return _switch_refusal(
+                    "detached_unreachable",
+                    "HEAD is detached and its commit is on no branch.",
+                    previous_sha)
+        elif head == branch:
+            return {"ok": True, "code": "already_on", "error": None, "detail": None,
+                    "path": str(folder), "branch": branch, "previous_branch": head,
+                    "detached": False, "warning": None}
+
+        porcelain = await _git(root, "status", "--porcelain")
+        dirty = _dirty_from_status(porcelain)
+        if dirty["staged"] or dirty["unstaged"]:
+            return _switch_refusal(
+                "dirty_tree",
+                "Tracked files have changes. Commit or discard them first.",
+                f"{dirty['staged']} staged, {dirty['unstaged']} unstaged",
+                dirty=dirty)
+
+        local_code, _local_out, _local_err = await _run(
+            ["git", "-C", root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            timeout=GIT_TIMEOUT)
+        remote_code = 1
+        if local_code != 0:
+            remote_code, _remote_out, _remote_err = await _run(
+                ["git", "-C", root, "show-ref", "--verify", "--quiet",
+                 f"refs/remotes/origin/{branch}"], timeout=GIT_TIMEOUT)
+        if local_code != 0 and remote_code != 0:
+            return _switch_refusal("unknown_branch",
+                                   f"The branch {branch} is not in this clone.",
+                                   "git show-ref refs/heads and refs/remotes/origin")
+
+        if local_code == 0:
+            listing = await _git(root, "worktree", "list", "--porcelain")
+            for ref, path in _worktree_rows(listing):
+                if ref == f"refs/heads/{branch}" and os.path.realpath(path) != os.path.realpath(root):
+                    return _switch_refusal(
+                        "checked_out_elsewhere",
+                        f"The branch is checked out in another worktree: {path}",
+                        path, worktree=path)
+
+        argv = (["git", "-C", root, "switch", branch] if local_code == 0 else
+                ["git", "-C", root, "switch", "--track", f"origin/{branch}"])
+        code, _out, err = await _run(argv, timeout=SWITCH_TIMEOUT)
+        if code != 0:
+            return _switch_refusal("switch_failed", _git_line(err),
+                                   "git switch exited non-zero", branch=branch)
+        now = (await _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")).strip()
+        if now != branch:
+            return _switch_refusal("switch_failed", "The folder did not move to the branch.",
+                                   f"HEAD is on {now or 'a detached commit'}")
+    except TimeoutError as exc:
+        return _switch_refusal("upstream_error", f"git did not answer for {folder}.", str(exc))
+    except _GitError as exc:
+        return _switch_refusal("upstream_error", f"git could not read {folder}.", str(exc))
+
+    _CACHE.pop(("repo", root), None)
+    _CACHE.pop(("repo", str(folder)), None)
+    warning = (f"{dirty['untracked']} untracked file(s) stay where they are."
+               if dirty["untracked"] else None)
+    return {"ok": True, "code": "switched", "error": None, "detail": None,
+            "path": str(folder), "branch": branch, "previous_branch": head,
+            "previous_sha": previous_sha, "detached": False,
+            "tracked": None if local_code == 0 else f"origin/{branch}",
+            "warning": warning, "dirty": dirty}
 
 
 # --- Routes -----------------------------------------------------------------
@@ -1955,18 +3025,155 @@ async def repo(path: str = Query(..., description="Absolute path to the project 
     return payload
 
 
+@router.get("/git/graph")
+async def git_graph(path: str = Query(..., description="Absolute path to the project folder"),
+                    limit: int = Query(200),
+                    refresh: int = Query(0, ge=0, le=1)) -> dict[str, Any]:
+    """The local commit DAG for one folder: rows newest first, refs, and their track.
+
+    ``limit`` clamps to 50..500. The refs and HEAD reads run on every call and
+    form a fingerprint; the log is read only when that fingerprint changes or
+    the 300 s entry has expired. Tags are labels on a commit and never a lane.
+
+    ``head`` names the checked out branch (or the sha when detached),
+    ``default_branch`` is ``origin/main`` style from the remote HEAD symref, and
+    ``refs_outside`` counts refs pointing past the window. Failures are codes
+    with HTTP 200: a folder that is gone, outside git, or has no commits yet.
+    """
+    try:
+        folder = _resolve_folder(path)
+    except _FolderMissing as exc:
+        return _graph_failure(exc.path, "folder_missing", f"Folder not found: {exc.path}",
+                              exc.path)
+    limit = max(GRAPH_MIN_LIMIT, min(GRAPH_MAX_LIMIT, limit))
+    try:
+        root, code, error, detail = await _history_root(folder)
+    except TimeoutError as exc:
+        return _graph_failure(str(folder), "upstream_error",
+                              f"Git could not read {folder} in time.", str(exc))
+    if not root:
+        return _graph_failure(str(folder), code, error or f"Git could not read {folder}.",
+                              detail)
+    try:
+        head_sha, branch_ref, fingerprint, probe_refs = await _graph_probe(root)
+    except TimeoutError as exc:
+        return _graph_failure(str(folder), "upstream_error",
+                              f"Git could not read the history of {root} in time.", str(exc))
+    except _GitError as exc:
+        return _graph_failure(str(folder), "upstream_error",
+                              f"Git could not read the history of {root}.", str(exc))
+    if not probe_refs.strip() and not head_sha:
+        return _graph_failure(str(folder), "empty_repo", "No commits yet.",
+                              f"git -C {root} for-each-ref")
+
+    key = ("git-graph", root, fingerprint, limit)
+    if not refresh:
+        hit = _lru_get(_GRAPH_CACHE, key)
+        if hit is not None:
+            return hit
+    async with _graph_lock((root, limit)):
+        if not refresh:
+            hit = _lru_get(_GRAPH_CACHE, key)
+            if hit is not None:
+                return hit
+        try:
+            payload = await _graph_read(root, limit, head_sha, branch_ref, fingerprint)
+        except TimeoutError as exc:
+            return _graph_failure(str(folder), "upstream_error",
+                                  f"Git could not read the history of {root} in time.",
+                                  str(exc), limit=limit, root=root)
+        except _GitError as exc:
+            return _graph_failure(str(folder), "upstream_error",
+                                  f"Git could not read the history of {root}.", str(exc),
+                                  limit=limit, root=root)
+        _lru_put(_GRAPH_CACHE, key, payload, ttl=GRAPH_TTL, size=MAX_GRAPH_ENTRIES)
+        return payload
+
+
+@router.get("/git/commit/{sha}")
+async def git_commit(sha: str,
+                     path: str = Query(..., description="Absolute path to the project folder"),
+                     refresh: int = Query(0, ge=0, le=1)) -> dict[str, Any]:
+    """One commit: message, numstat totals and a unified diff against the first parent.
+
+    ``sha`` must be 7 to 40 hex characters and is resolved with
+    ``rev-parse`` before any other argv sees it, so a blob or an unknown id is
+    ``not_found`` and never reaches ``show``. The diff runs with
+    ``--no-ext-diff --no-textconv --no-show-signature`` because the folder's own
+    config can name a diff driver, a textconv command or a gpg program.
+
+    The patch is capped while it is read: 512 KiB, 6,000 lines, 300 files. Past
+    a cap the remaining files are still listed with ``hunks: []`` and
+    ``truncated_reason`` says which cap was hit. Merges are diffed against the
+    first parent; a root commit is diffed against the empty tree.
+    """
+    if not _SHA_RE.match(sha or ""):
+        return _commit_failure(sha, "bad_sha",
+                               "That commit id is not valid. Use 7 to 40 hex characters.",
+                               "git rev-parse was not called")
+    try:
+        folder = _resolve_folder(path)
+    except _FolderMissing as exc:
+        return _commit_failure(sha, "folder_missing", f"Folder not found: {exc.path}", exc.path)
+    try:
+        root, code, error, detail = await _history_root(folder)
+    except TimeoutError as exc:
+        return _commit_failure(sha, "upstream_error",
+                               f"Git could not read {folder} in time.", str(exc))
+    if not root:
+        return _commit_failure(sha, code, error or f"Git could not read {folder}.", detail)
+
+    try:
+        full_code, full_out, full_err = await _run(
+            ["git", "-C", root, "rev-parse", "--verify", "--quiet", "--end-of-options",
+             f"{sha}^{{commit}}"], timeout=GIT_TIMEOUT)
+    except TimeoutError as exc:
+        return _commit_failure(sha, "upstream_error",
+                               f"Git could not resolve {sha} in time.", str(exc))
+    full = full_out.strip()
+    if full_code != 0 or not full:
+        return _commit_failure(sha, "not_found", f"No commit {sha} in this repository.",
+                               full_err.strip() or f"git -C {root} rev-parse {sha}^{{commit}}")
+
+    key = (root, full)
+    if not refresh:
+        hit = _lru_get(_DIFF_CACHE, key)
+        if hit is not None:
+            return hit
+    try:
+        payload = await _commit_read(root, full)
+    except TimeoutError as exc:
+        return _commit_failure(sha, "upstream_error",
+                               f"The diff for {full[:7]} took too long to read.", str(exc))
+    except _GitError as exc:
+        return _commit_failure(sha, "upstream_error",
+                               f"The diff for {full[:7]} could not be read.", str(exc))
+    _lru_put(_DIFF_CACHE, key, payload, ttl=COMMIT_TTL, size=MAX_DIFF_ENTRIES)
+    return payload
+
+
 @router.get("/github")
 async def github(path: str = Query(..., description="Absolute path to the project folder"),
-                 state: str = Query("open", pattern="^(open|closed|all)$"),
+                 state: str = Query("all", pattern="^(open|closed|all)$"),
                  limit: int = Query(50, ge=1, le=100),
                  refresh: int = Query(0, ge=0, le=1)) -> dict[str, Any]:
     """Issues and PRs for the folder's GitHub remote, with resolved issue links.
 
-    ``issues`` excludes pull requests (GitHub returns PRs from the issues
-    endpoint). ``prs[].head_ref`` is the key the Desktop half joins sessions on,
-    so it is returned verbatim. ``counts`` is the aggregate block for the charts.
-    ``prs[].enriched`` marks the rows carrying the GraphQL pass (review decision,
-    checks rollup, merge state): the most recently updated MAX_PRS_ENRICHED rows.
+    ``state`` defaults to ``all``: one Desktop read carries the open half and the
+    closed half, so the Open / Closed / Merged / Draft filters never ask again.
+    ``limit`` caps each list per state, so ``all`` returns up to ``2 * limit``
+    rows split between open and closed; ``open`` and ``closed`` keep the old
+    meaning exactly (one list, at most ``limit`` rows).
+
+    Every issue row carries ``state`` and, once closed, ``state_reason``
+    (completed, not_planned, duplicate) as GitHub reports it. Every PR row
+    carries ``state``, ``draft`` and ``merged``, and a merged PR stays in the
+    closed half. ``issues`` excludes pull requests (GitHub returns PRs from the
+    issues endpoint). ``prs[].head_ref`` is the key the Desktop half joins
+    sessions on, so it is returned verbatim. ``counts`` is the aggregate block
+    for the charts and always counts open rows only. ``prs[].enriched`` marks
+    the rows carrying the GraphQL pass (review decision, checks rollup, merge
+    state): the most recently updated MAX_PRS_ENRICHED rows.
 
     Every payload carries ``ok``, ``code``, ``error`` and ``detail``; a rejected
     token is retried through the gh CLI and ``auth``/``auth_note`` say which
@@ -1994,24 +3201,44 @@ async def github(path: str = Query(..., description="Absolute path to the projec
 
     gh = _GhReader(owner, name, mode, token)
     board = f"/repos/{owner}/{name}"
+    # GitHub cannot return open and closed while keeping a bounded open window,
+    # so `all` is two reads of each resource: open first (the same window a plain
+    # `state=open` read gives), then the closed half. That is still one request
+    # from the Desktop and one cache entry, never one per filter click.
+    reads = ("open", "closed") if state == "all" else (state,)
+    issues_raw: list[dict[str, Any]] = []
+    pulls_raw: list[dict[str, Any]] = []
+    headers: Mapping[str, str] = {}
     try:
-        # /issues also returns pull requests, so fetch a full page and slice the
-        # filtered result: asking for 50 issues should yield up to 50 issues.
-        issues_response = await gh.rest(
-            f"{board}/issues",
-            {"state": state, "per_page": 100, "sort": "updated", "direction": "desc"},
-            etag=stale.etag if stale is not None else None,
-        )
-        if issues_response.status == 304 and stale is not None:
-            payload = {**stale.payload, "cached": True}
-            _cache_put(key, payload, etag=stale.etag)
-            return payload
-        pulls_response = await gh.rest(
-            f"{board}/pulls", {"state": state, "per_page": limit, "sort": "updated", "direction": "desc"})
-        issues_raw = issues_response.data if isinstance(issues_response.data, list) else []
-        pulls_raw = [p for p in (pulls_response.data if isinstance(pulls_response.data, list) else [])
-                     if isinstance(p, dict)]
-        enriched = await _enrich_pulls(gh, [_int(p.get("number")) for p in pulls_raw])
+        for index, read_state in enumerate(reads):
+            # A conditional read is only honest for a single-state fetch: with
+            # two reads a 304 on one half would not describe the other.
+            etag = stale.etag if (stale is not None and len(reads) == 1) else None
+            # /issues also returns pull requests, so fetch a full page and slice
+            # the filtered result: asking for 50 issues should yield up to 50.
+            issues_response = await gh.rest(
+                f"{board}/issues",
+                {"state": read_state, "per_page": 100, "sort": "updated", "direction": "desc"},
+                etag=etag,
+            )
+            if issues_response.status == 304 and stale is not None:
+                payload = {**stale.payload, "cached": True}
+                _cache_put(key, payload, etag=stale.etag)
+                return payload
+            pulls_response = await gh.rest(
+                f"{board}/pulls", {"state": read_state, "per_page": limit,
+                                   "sort": "updated", "direction": "desc"})
+            if index == 0:
+                headers = issues_response.headers
+            issues_raw.extend(i for i in (issues_response.data
+                                          if isinstance(issues_response.data, list) else [])
+                              if isinstance(i, dict) and "pull_request" not in i)
+            pulls_raw.extend(p for p in (pulls_response.data
+                                         if isinstance(pulls_response.data, list) else [])
+                             if isinstance(p, dict))
+        issues_window = _cap_states(_state_sort(issues_raw), limit)
+        pulls_window = _cap_states(_state_sort(pulls_raw), limit)
+        enriched = await _enrich_pulls(gh, [_int(p.get("number")) for p in pulls_window])
     except _UpstreamError as exc:
         account = await _account_name(gh, token)
         log.warning("project-command-center: GitHub read failed for %s/%s: %s", owner, name, exc)
@@ -2020,19 +3247,20 @@ async def github(path: str = Query(..., description="Absolute path to the projec
                             detail=exc.detail, auth=gh.auth, auth_note=gh.auth_note,
                             auth_account=account)
 
-    issues = [_issue_row(i) for i in issues_raw if isinstance(i, dict) and "pull_request" not in i][:limit]
-    pulls = [_pull_row(p, enriched.get(_int(p.get("number")))) for p in pulls_raw]
+    issues = [_issue_row(i) for i in issues_window]
+    pulls = [_pull_row(p, enriched.get(_int(p.get("number")))) for p in pulls_window]
     fetched_at = _now_iso()
     account = await _account_name(gh, token) if gh.auth_note else None
     payload = {
         "ok": True, "code": "ok", "error": None, "detail": None,
         "repo": name, "owner": owner, "url": url, "fetched_at": fetched_at, "cached": False,
         "auth": gh.auth, "auth_note": gh.auth_note, "auth_account": account,
-        "rate_limit": _rate_limit(issues_response.headers),
+        "rate_limit": _rate_limit(headers),
+        "states": list(reads),
         "issues": issues, "prs": pulls, "counts": _counts(issues, pulls),
         "updated_at": fetched_at,
     }
-    _cache_put(key, payload, etag=issues_response.headers.get("etag"))
+    _cache_put(key, payload, etag=headers.get("etag"))
     return payload
 
 
@@ -2145,9 +3373,10 @@ async def github_issue(number: int, path: str = Query(..., description="Absolute
         "title": str(raw.get("title") or ""),
         "state": str(raw.get("state") or "open"),
         "state_reason": raw.get("state_reason"),
-        "author": _login(raw.get("user")),
+        **_actor_fields(raw.get("user")),
         "labels": _names(raw.get("labels"), "name"),
         "assignees": _names(raw.get("assignees"), "login"),
+        **({"assignee_avatars": avatars} if (avatars := _assignee_avatars(raw.get("assignees"))) else {}),
         "comments": comments,
         "comments_count": _int(raw.get("comments")),
         "created_at": raw.get("created_at"),
@@ -2234,15 +3463,26 @@ async def github_refs(path: str = Query(..., description="Absolute path to the p
             if not isinstance(node, dict):
                 continue  # GitHub has no such number: omitted, never invented
             state = str(node.get("state") or "").lower()
-            found[str(number)] = {
+            login, avatar, bot = _actor(node.get("author"))
+            kind = "pr" if str(node.get("__typename") or "") == "PullRequest" else "issue"
+            entry: RefRow = {
                 "number": _int(node.get("number")) or number,
-                "kind": "pr" if str(node.get("__typename") or "") == "PullRequest" else "issue",
+                "kind": kind,
                 "title": str(node.get("title") or ""),
                 "state": "closed" if state in ("closed", "merged") else "open",
-                "author": _login(node.get("author")),
+                # The chip colours like the row: a merged PR and a closed issue
+                # closed as completed are purple, not planned or duplicate red.
+                "state_reason": str(node.get("stateReason") or "").lower() or None,
+                "draft": bool(node.get("isDraft")),
+                "merged": bool(node.get("merged")),
+                "author": login,
+                "author_bot": bot,
                 "updated_at": node.get("updatedAt"),
                 "url": node.get("url"),
             }
+            if avatar:
+                entry["author_avatar"] = avatar
+            found[str(number)] = entry
         return found
 
     refs = parse(data)
@@ -2632,7 +3872,7 @@ def _broadcast_board(kind: str, project_id: Optional[str], **fields: Any) -> Non
 
 
 def _auto_link(store: Any, session_id: Optional[str]) -> dict[str, Any]:
-    """Which project the asking session is in, and how that was decided."""
+    """Which project the asking session is in, how that was decided, and the lane its card shows."""
     _, link = store.resolve_link(session_id) if session_id else ("", None)
     resolved = store.resolve_project(session_id=session_id)
     try:
@@ -2646,14 +3886,17 @@ def _auto_link(store: Any, session_id: Optional[str]) -> dict[str, Any]:
         via = "session_link"
     else:
         via = "cwd_prefix"
-    return {"session_id": session_id or "", "project_id": resolved, "via": via, "cwd": cwd}
+    # The same rule the renderer applies: the session's own lane wins, else the project's.
+    lane = store.resolve_lane(link, store.get_status(resolved) if resolved else None)
+    return {"session_id": session_id or "", "project_id": resolved, "via": via, "cwd": cwd,
+            "lane": lane}
 
 
 @router.get("/board")
 def board(session_id: Optional[str] = Query(None, description="Session asking, for auto_link")) -> dict[str, Any]:
-    """Every board row: statuses, session links, how many projects are synced, and where the asking
-    session is. A broken database is ``ok: false, code: store_error`` with empty collections, not a
-    500: the Desktop page still renders.
+    """Every board row: statuses, session links (each with its own lane), how many projects are
+    synced, and where the asking session is. A broken database is ``ok: false, code: store_error``
+    with empty collections, not a 500: the Desktop page still renders.
 
     ``def``, not ``async def``: this body does blocking SQLite with a 5 s busy timeout, so FastAPI
     must run it in the threadpool instead of stalling the gateway event loop.
@@ -2664,7 +3907,9 @@ def board(session_id: Optional[str] = Query(None, description="Session asking, f
     except Exception as exc:
         empty: dict[str, Any] = {"statuses": [], "links": [], "projects_synced": 0}
         return _board_failure(exc, auto_link={"session_id": session_id or "", "project_id": None,
-                                              "via": None, "cwd": ""}, **empty)
+                                              "via": None, "cwd": "",
+                                              "lane": {"status": "", "scope": "", "source": "",
+                                                       "note": "", "updated_at": None}}, **empty)
     return {
         "ok": True,
         "statuses": payload.get("statuses", []),
@@ -2676,18 +3921,29 @@ def board(session_id: Optional[str] = Query(None, description="Session asking, f
 
 @router.post("/board/status")
 def board_status(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    """Set one project's lane. ``source`` is always ``user`` here; the agent tool records ``agent``.
-    A bad lane is ``code: bad_status`` and an id the board never synced is ``code: unknown_project``,
-    both HTTP 200."""
+    """Set one card's lane. With a ``session_id`` (or ``scope: "session"``) this moves that session's
+    own card and note, creating its link row when it has none; otherwise it moves the project lane,
+    as before. ``source`` is always ``user`` here; the agent tool records ``agent``. A bad lane is
+    ``code: bad_status``, an id the board never synced is ``code: unknown_project``, and a session
+    carded under a different project is ``code: project_mismatch``, all HTTP 200."""
     project_id = str(payload.get("project_id") or "").strip()
+    session_id = str(payload.get("session_id") or "").strip()
     status = str(payload.get("status") or "").strip()
     note = payload.get("note")
+    scope = str(payload.get("scope") or "auto").strip().lower()
     try:
-        result = _board_store().set_status(project_id, status, note, "user")
+        result = _board_store().set_status(project_id, status, note, "user",
+                                           session_id=session_id or None, scope=scope)
     except Exception as exc:
         return _board_failure(exc)
     if result.get("ok"):
-        _broadcast_board("status", project_id, status=result["status"]["status"], source="user")
+        if result.get("scope") == "session":
+            link = result["link"]
+            _broadcast_board("status", link.get("project_id") or project_id,
+                             status=link.get("status"), session_id=link.get("session_id"),
+                             source="user")
+        else:
+            _broadcast_board("status", project_id, status=result["status"]["status"], source="user")
     return result
 
 

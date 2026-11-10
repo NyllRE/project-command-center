@@ -1,0 +1,67 @@
+{
+  "description": "Two independent tips share one parent. The second tip converges into the parent dot.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "a",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "a"
+      },
+      {
+        "name": "refs/heads/feature",
+        "short": "feature",
+        "kind": "local",
+        "sha": "b"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "a",
+        "parents": [
+          "p"
+        ],
+        "subject": "a"
+      },
+      {
+        "sha": "b",
+        "parents": [
+          "p"
+        ],
+        "subject": "b"
+      },
+      {
+        "sha": "p",
+        "parents": [],
+        "subject": "p"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 2,
+    "maxLanes": 2,
+    "lanes": {
+      "a": 0,
+      "b": 1,
+      "p": 0
+    },
+    "converging": {
+      "p": [
+        1
+      ]
+    },
+    "bandEdges": [
+      1,
+      2,
+      0
+    ]
+  },
+  "name": "two-tips-one-parent"
+}

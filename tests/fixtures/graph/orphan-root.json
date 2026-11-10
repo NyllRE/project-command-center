@@ -1,0 +1,67 @@
+{
+  "description": "A second disconnected history gets its own lane and its root ends the lane at the dot.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "a2",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "a2"
+      },
+      {
+        "name": "refs/heads/other",
+        "short": "other",
+        "kind": "local",
+        "sha": "a1"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "a2",
+        "parents": [
+          "r2"
+        ],
+        "subject": "a2"
+      },
+      {
+        "sha": "r2",
+        "parents": [],
+        "subject": "r2"
+      },
+      {
+        "sha": "a1",
+        "parents": [
+          "r1"
+        ],
+        "subject": "a1"
+      },
+      {
+        "sha": "r1",
+        "parents": [],
+        "subject": "r1"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 2,
+    "maxLanes": 2,
+    "lanes": {
+      "a2": 0,
+      "r2": 0,
+      "a1": 1,
+      "r1": 1
+    },
+    "roots": {
+      "r2": 0,
+      "r1": 1
+    }
+  },
+  "name": "orphan-root"
+}

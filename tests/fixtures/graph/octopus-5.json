@@ -1,0 +1,104 @@
+{
+  "description": "Five parents fan right in order, then converge on the base without crossing.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "o",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "o"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "o",
+        "parents": [
+          "a",
+          "b",
+          "c",
+          "d",
+          "e"
+        ],
+        "subject": "o"
+      },
+      {
+        "sha": "a",
+        "parents": [
+          "base"
+        ],
+        "subject": "a"
+      },
+      {
+        "sha": "b",
+        "parents": [
+          "base"
+        ],
+        "subject": "b"
+      },
+      {
+        "sha": "c",
+        "parents": [
+          "base"
+        ],
+        "subject": "c"
+      },
+      {
+        "sha": "d",
+        "parents": [
+          "base"
+        ],
+        "subject": "d"
+      },
+      {
+        "sha": "e",
+        "parents": [
+          "base"
+        ],
+        "subject": "e"
+      },
+      {
+        "sha": "base",
+        "parents": [],
+        "subject": "base"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 3,
+    "maxLanes": 5,
+    "lanes": {
+      "o": 0,
+      "a": 0,
+      "b": 1,
+      "c": 2,
+      "d": 3,
+      "e": 4,
+      "base": 0
+    },
+    "converging": {
+      "base": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    "fan": {
+      "o": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    }
+  },
+  "name": "octopus-5"
+}

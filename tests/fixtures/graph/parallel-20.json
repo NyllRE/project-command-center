@@ -1,0 +1,196 @@
+{
+  "description": "Twenty tips waiting on one parent. The engine keeps all lanes; geometry clips past 16.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "t0",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "t0"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "t0",
+        "parents": [
+          "p"
+        ],
+        "subject": "t0"
+      },
+      {
+        "sha": "t1",
+        "parents": [
+          "p"
+        ],
+        "subject": "t1"
+      },
+      {
+        "sha": "t2",
+        "parents": [
+          "p"
+        ],
+        "subject": "t2"
+      },
+      {
+        "sha": "t3",
+        "parents": [
+          "p"
+        ],
+        "subject": "t3"
+      },
+      {
+        "sha": "t4",
+        "parents": [
+          "p"
+        ],
+        "subject": "t4"
+      },
+      {
+        "sha": "t5",
+        "parents": [
+          "p"
+        ],
+        "subject": "t5"
+      },
+      {
+        "sha": "t6",
+        "parents": [
+          "p"
+        ],
+        "subject": "t6"
+      },
+      {
+        "sha": "t7",
+        "parents": [
+          "p"
+        ],
+        "subject": "t7"
+      },
+      {
+        "sha": "t8",
+        "parents": [
+          "p"
+        ],
+        "subject": "t8"
+      },
+      {
+        "sha": "t9",
+        "parents": [
+          "p"
+        ],
+        "subject": "t9"
+      },
+      {
+        "sha": "t10",
+        "parents": [
+          "p"
+        ],
+        "subject": "t10"
+      },
+      {
+        "sha": "t11",
+        "parents": [
+          "p"
+        ],
+        "subject": "t11"
+      },
+      {
+        "sha": "t12",
+        "parents": [
+          "p"
+        ],
+        "subject": "t12"
+      },
+      {
+        "sha": "t13",
+        "parents": [
+          "p"
+        ],
+        "subject": "t13"
+      },
+      {
+        "sha": "t14",
+        "parents": [
+          "p"
+        ],
+        "subject": "t14"
+      },
+      {
+        "sha": "t15",
+        "parents": [
+          "p"
+        ],
+        "subject": "t15"
+      },
+      {
+        "sha": "t16",
+        "parents": [
+          "p"
+        ],
+        "subject": "t16"
+      },
+      {
+        "sha": "t17",
+        "parents": [
+          "p"
+        ],
+        "subject": "t17"
+      },
+      {
+        "sha": "t18",
+        "parents": [
+          "p"
+        ],
+        "subject": "t18"
+      },
+      {
+        "sha": "t19",
+        "parents": [
+          "p"
+        ],
+        "subject": "t19"
+      },
+      {
+        "sha": "p",
+        "parents": [],
+        "subject": "p"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 2,
+    "maxLanes": 20,
+    "laneCount": 20,
+    "converging": {
+      "p": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ]
+    }
+  },
+  "name": "parallel-20"
+}

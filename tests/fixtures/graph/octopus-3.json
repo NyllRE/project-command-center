@@ -1,0 +1,82 @@
+{
+  "description": "Three parents fan right in parent order, then all three lanes converge on the base.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "o",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "o"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "o",
+        "parents": [
+          "a",
+          "b",
+          "c"
+        ],
+        "subject": "o"
+      },
+      {
+        "sha": "a",
+        "parents": [
+          "base"
+        ],
+        "subject": "a"
+      },
+      {
+        "sha": "b",
+        "parents": [
+          "base"
+        ],
+        "subject": "b"
+      },
+      {
+        "sha": "c",
+        "parents": [
+          "base"
+        ],
+        "subject": "c"
+      },
+      {
+        "sha": "base",
+        "parents": [],
+        "subject": "base"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 3,
+    "maxLanes": 3,
+    "lanes": {
+      "o": 0,
+      "a": 0,
+      "b": 1,
+      "c": 2,
+      "base": 0
+    },
+    "converging": {
+      "base": [
+        1,
+        2
+      ]
+    },
+    "bandEdges": [
+      3,
+      3,
+      3,
+      3,
+      0
+    ]
+  },
+  "name": "octopus-3"
+}

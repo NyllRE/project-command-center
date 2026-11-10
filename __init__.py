@@ -5,7 +5,8 @@ same local SQLite file through ``board_store.py`` at the plugin root, so a statu
 the status the board shows after the next ``board.changed`` event.
 
   * ``pcc_board``       read the board, optionally one project's row, links and status.
-  * ``pcc_set_status``  move a project to backlog / active / review / blocked / done.
+  * ``pcc_set_status``  move this session's card, or a project's, to backlog / active / review /
+    blocked / done.
   * ``pcc_work_item``   attach or detach the issue or PR the current session works on.
 
 ``hooks.py`` holds the two agent hooks registered alongside the tools: ``pre_llm_call`` injects a
@@ -35,7 +36,7 @@ from typing import Any, Callable, Optional
 log = logging.getLogger(__name__)
 
 PLUGIN_NAME = "project-command-center"
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 TOOLSET = "project_command_center"
 
 _STORE_LOCK = threading.Lock()
@@ -143,8 +144,31 @@ def _pcc_set_status(args: dict[str, Any], **kwargs: Any) -> str:
     status = str(args.get("status") or "").strip().lower()
     if not status:
         return _json({"ok": False, "code": "missing_status", "error": "status is required"})
-    session_id = _session_id(kwargs)
-    project_id = store.resolve_project(session_id=session_id, explicit=args.get("project"))
+    calling = _session_id(kwargs)
+    wanted_session = str(args.get("session_id") or "").strip()
+    wanted_project = str(args.get("project") or "").strip()
+    # An explicit session id always means that session's card. Without one, the calling session's
+    # card is the default, unless the caller named a project: then the project lane moves, which is
+    # what this tool did before sessions had lanes.
+    session_id = wanted_session or (calling if not wanted_project else "")
+    if session_id:
+        project_id = store.resolve_project(session_id=session_id, explicit=wanted_project)
+        if not project_id:
+            return _json({"ok": False, "code": "unknown_project",
+                          "error": "no project matched: pass project, or attach this session first"})
+        result = store.set_status(project_id, status, args.get("note"), "agent",
+                                  auto_project=True, session_id=session_id)
+        if not result.get("ok"):
+            return _json(result)
+        link = result["link"]
+        _broadcast("status", link.get("project_id") or project_id, status=link.get("status"),
+                   session_id=link.get("session_id"), source="agent")
+        return _json({"ok": True, "code": "ok", "scope": "session",
+                      "session_id": link.get("session_id"), "project_id": project_id,
+                      "status": link.get("status"), "note": link.get("note"),
+                      "source": link.get("status_source"),
+                      "updated_at": link.get("status_updated_at")})
+    project_id = store.resolve_project(session_id=calling, explicit=wanted_project)
     if not project_id:
         return _json({"ok": False, "code": "unknown_project",
                       "error": "no project matched: pass project, or attach this session first"})
@@ -153,8 +177,9 @@ def _pcc_set_status(args: dict[str, Any], **kwargs: Any) -> str:
         return _json(result)
     row = result["status"]
     _broadcast("status", project_id, status=row["status"], source="agent")
-    return _json({"ok": True, "code": "ok", "project_id": project_id, "status": row["status"],
-                  "note": row["note"], "source": row["source"], "updated_at": row["updated_at"]})
+    return _json({"ok": True, "code": "ok", "scope": "project", "project_id": project_id,
+                  "status": row["status"], "note": row["note"], "source": row["source"],
+                  "updated_at": row["updated_at"]})
 
 
 @_guard("pcc_work_item")
@@ -216,8 +241,8 @@ _PROJECT_ARG = {
 
 _BOARD_SCHEMA = {
     "description": ("Read the Project Command Center board: every project's lane (backlog, active, "
-                    "review, blocked, done), the issue or PR each session is attached to, and which "
-                    "project the current session resolves to. Read only."),
+                    "review, blocked, done), every session's own lane and the issue or PR it is "
+                    "attached to, and which project the current session resolves to. Read only."),
     "parameters": {
         "type": "object",
         "properties": {"project": _PROJECT_ARG},
@@ -225,17 +250,26 @@ _BOARD_SCHEMA = {
     },
 }
 
+_SESSION_ARG = {
+    "type": "string",
+    "description": ("The session whose card this moves: this session's card by default when the tool "
+                    "runs inside a session. Omit it (and pass project) to move the project's lane "
+                    "instead."),
+}
+
 _STATUS_SCHEMA = {
-    "description": ("Move a project on the Project Command Center board. Writes the status and an "
-                    "optional note to the board store, records source 'agent', and refreshes the "
-                    "Desktop board."),
+    "description": ("Move a card on the Project Command Center board. By default this session's card "
+                    "moves, so the session shows its own lane; pass project and no session_id to "
+                    "move the project's card. Writes the status and an optional note with source "
+                    "'agent', and refreshes the Desktop board."),
     "parameters": {
         "type": "object",
         "properties": {
             "status": {"type": "string", "enum": ["backlog", "active", "review", "blocked", "done"],
-                       "description": "The lane the project belongs in now."},
+                       "description": "The lane the card belongs in now."},
             "project": _PROJECT_ARG,
             "note": {"type": "string", "description": "One short line shown on the card."},
+            "session_id": _SESSION_ARG,
         },
         "required": ["status"],
         "additionalProperties": False,

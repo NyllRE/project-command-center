@@ -193,6 +193,51 @@ def main() -> int:
     check("broadcast board.changed kind=link pr=42",
           events == [("project-command-center", "board.changed",
                       {"project_id": "pcc", "kind": "link", "pr": 42, "source": "auto"})], str(events))
+    check("the session's own lane moved to review",
+          link("s-create").get("status") == "review", str(link("s-create").get("status")))
+    check("the session lane records source auto",
+          link("s-create").get("status_source") == "auto", str(link("s-create").get("status_source")))
+
+    # --- session lanes: tool scope, hook text, a person's lane --------------
+    section("session lanes / tool scope and hook text")
+    store.set_link("s-lane", "pcc", repo=repo, issue=7, title=title)
+    store.set_status("pcc", "active", "in flight", "user")
+    moved = json.loads(plugin._pcc_set_status({"status": "blocked", "note": "waiting"},
+                                              session_id="s-lane"))
+    print(f"  tool:         {moved.get('code')} scope={moved.get('scope')} "
+          f"session={link('s-lane').get('status')} project={lane()}")
+    check("pcc_set_status with no project moves this session's card",
+          moved.get("ok") and moved.get("scope") == "session"
+          and link("s-lane").get("status") == "blocked", str(moved.get("code")))
+    check("the project lane is left alone", lane() == "active", str(lane()))
+    card = hooks.pre_llm_call(session_id="s-lane") or {}
+    print(f"  hook text:    {card.get('context', '').splitlines()[:1]}")
+    check("pre_llm_call names the session's lane",
+          card.get("context", "").splitlines()[:1]
+          == ["Board: Project Command Center \u2014 blocked"],
+          repr(card.get("context", "").splitlines()[:1]))
+    project_move = json.loads(plugin._pcc_set_status({"status": "review", "project": "pcc"},
+                                                     session_id="s-lane"))
+    print(f"  project move: {project_move.get('code')} scope={project_move.get('scope')} "
+          f"session={link('s-lane').get('status')} project={lane()}")
+    check("an explicit project moves the project lane", project_move.get("scope") == "project"
+          and lane() == "review", str(project_move.get("code")))
+    check("the session lane survives a project move", link("s-lane").get("status") == "blocked",
+          str(link("s-lane").get("status")))
+    picked = store.resolve_lane(store.get_link("s-lane"), store.get_status("pcc"))
+    check("resolve_lane prefers the session lane", picked.get("status") == "blocked"
+          and picked.get("scope") == "session", str(picked))
+
+    store.set_link("s-lane-done", "pcc", repo=repo, issue=7, title=title)
+    store.set_status("pcc", "done", "shipped", "user", session_id="s-lane-done")
+    hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},
+                         result=f"https://github.com/{repo}/pull/44\n", session_id="s-lane-done")
+    print(f"  done lane:    session={link('s-lane-done').get('status')} "
+          f"source={link('s-lane-done').get('status_source')} pr={link('s-lane-done').get('pr')}")
+    check("auto-link never overwrites a lane a person set",
+          link("s-lane-done").get("status") == "done"
+          and link("s-lane-done").get("status_source") == "user"
+          and link("s-lane-done").get("pr") == 44, str(link("s-lane-done")))
 
     # --- post_tool_call: negatives -----------------------------------------
     def reset(session: str, lane_name: str = "active") -> None:

@@ -1,0 +1,48 @@
+{
+  "description": "The oldest commit's parent is outside the window. Its lane stays open and becomes a bottom stub.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "a",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "a"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "a",
+        "parents": [
+          "b"
+        ],
+        "subject": "a"
+      },
+      {
+        "sha": "b",
+        "parents": [
+          "outside"
+        ],
+        "subject": "b"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 2,
+    "maxLanes": 1,
+    "lanes": {
+      "a": 0,
+      "b": 0
+    },
+    "stubBands": [
+      1
+    ]
+  },
+  "name": "parent-outside"
+}

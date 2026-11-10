@@ -1,0 +1,83 @@
+{
+  "description": "A merge greets a feature tip; the feature lane converges one row above the shared root.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "m",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "m"
+      },
+      {
+        "name": "refs/remotes/origin/main",
+        "short": "origin/main",
+        "kind": "remote",
+        "sha": "m"
+      },
+      {
+        "name": "refs/heads/feature",
+        "short": "feature",
+        "kind": "local",
+        "sha": "b"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "m",
+        "parents": [
+          "a",
+          "b"
+        ],
+        "subject": "m"
+      },
+      {
+        "sha": "a",
+        "parents": [
+          "f"
+        ],
+        "subject": "a"
+      },
+      {
+        "sha": "b",
+        "parents": [
+          "f"
+        ],
+        "subject": "b"
+      },
+      {
+        "sha": "f",
+        "parents": [],
+        "subject": "f"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 3,
+    "maxLanes": 2,
+    "lanes": {
+      "m": 0,
+      "a": 0,
+      "b": 1,
+      "f": 0
+    },
+    "converging": {
+      "f": [
+        1
+      ]
+    },
+    "bandEdges": [
+      2,
+      2,
+      2,
+      0
+    ]
+  },
+  "name": "fork-merge"
+}

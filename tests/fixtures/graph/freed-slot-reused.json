@@ -1,0 +1,64 @@
+{
+  "description": "A lane freed by a root is reusable on the next row, never on the same row.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "d",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "d"
+      },
+      {
+        "name": "refs/heads/feature",
+        "short": "feature",
+        "kind": "local",
+        "sha": "a"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "a",
+        "parents": [],
+        "subject": "a"
+      },
+      {
+        "sha": "c",
+        "parents": [
+          "d"
+        ],
+        "subject": "c"
+      },
+      {
+        "sha": "d",
+        "parents": [],
+        "subject": "d"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 1,
+    "maxLanes": 2,
+    "lanes": {
+      "a": 1,
+      "c": 1,
+      "d": 0
+    },
+    "reuse": {
+      "a": 1,
+      "c": 1
+    },
+    "freedRows": {
+      "a": [
+        1
+      ]
+    }
+  },
+  "name": "freed-slot-reused"
+}

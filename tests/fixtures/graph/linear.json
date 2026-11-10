@@ -1,0 +1,71 @@
+{
+  "description": "Four commits on one branch. One lane, no curves, no stubs.",
+  "input": {
+    "default_branch": "origin/main",
+    "head": {
+      "sha": "d",
+      "branch": "main",
+      "detached": false
+    },
+    "refs": [
+      {
+        "name": "refs/heads/main",
+        "short": "main",
+        "kind": "local",
+        "sha": "d"
+      },
+      {
+        "name": "refs/remotes/origin/main",
+        "short": "origin/main",
+        "kind": "remote",
+        "sha": "d"
+      }
+    ],
+    "commits": [
+      {
+        "sha": "d",
+        "parents": [
+          "c"
+        ],
+        "subject": "d"
+      },
+      {
+        "sha": "c",
+        "parents": [
+          "b"
+        ],
+        "subject": "c"
+      },
+      {
+        "sha": "b",
+        "parents": [
+          "a"
+        ],
+        "subject": "b"
+      },
+      {
+        "sha": "a",
+        "parents": [],
+        "subject": "a"
+      }
+    ]
+  },
+  "expect": {
+    "anomalies": 0,
+    "trunkSize": 4,
+    "maxLanes": 1,
+    "lanes": {
+      "d": 0,
+      "c": 0,
+      "b": 0,
+      "a": 0
+    },
+    "bandEdges": [
+      1,
+      1,
+      1,
+      0
+    ]
+  },
+  "name": "linear"
+}
