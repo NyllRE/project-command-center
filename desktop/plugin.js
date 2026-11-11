@@ -5023,44 +5023,28 @@ function continueSessionDraft({ branch, folder, owner, repo }) {
   return `Continue where we left off${where ? ` in ${where}` : ''}.\n\n`
 }
 
-// The Desktop bridge that owns git. Worktree creation is core's own flow, not
-// a reimplementation: `worktreeAdd` locally, the backend mirror for a remote
-// gateway, the same two doors the sidebar uses.
-function desktopBridge() {
-  return typeof window !== 'undefined' && window.hermesDesktop ? window.hermesDesktop : null
-}
-
-// `null` means "this build cannot list worktrees", which is different from an
-// empty list: only an empty list means no worktree exists for the branch.
+// Both worktree calls are this plugin's own routes on the dashboard backend, the
+// same place /branch/switch lives: the renderer needs no Desktop preload bridge,
+// only ctx.rest. `null` means "this build cannot list worktrees", which is
+// different from an empty list: only an empty list means no worktree exists for
+// the branch.
 function listWorktrees(folder) {
-  const desktop = desktopBridge()
+  if (!pluginCtx || typeof pluginCtx.rest !== 'function') return Promise.resolve(null)
 
-  if (desktop && desktop.git && typeof desktop.git.worktreeList === 'function') {
-    return Promise.resolve(desktop.git.worktreeList(folder)).then(rows => (Array.isArray(rows) ? rows : []))
-  }
-
-  if (desktop && typeof desktop.api === 'function') {
-    return Promise.resolve(desktop.api({ path: `/api/git/worktrees?path=${encodeURIComponent(folder)}`, method: 'GET' }))
-      .then(res => (res && Array.isArray(res.worktrees) ? res.worktrees : []))
-  }
-
-  return Promise.resolve(null)
+  return boardRest(`/worktrees?path=${encodeURIComponent(folder)}`, { method: 'GET' })
+    .then(res => (res && Array.isArray(res.worktrees) ? res.worktrees : []))
 }
 
+// The backend's refusal sentence wins: it is the same wording the other git
+// states carry, and the dialog shows it as it stands.
 function createWorktree(folder, options) {
-  const desktop = desktopBridge()
+  return boardRest('/worktree', { method: 'POST', body: { path: folder, ...options } }).then(res => {
+    if (!res || res.ok !== true) {
+      throw new Error(String((res && res.error) || 'The backend could not create the worktree.'))
+    }
 
-  if (desktop && desktop.git && typeof desktop.git.worktreeAdd === 'function') {
-    return Promise.resolve(desktop.git.worktreeAdd(folder, options))
-  }
-
-  if (desktop && typeof desktop.api === 'function') {
-    return Promise.resolve(
-      desktop.api({ path: '/api/git/worktree/add', method: 'POST', body: { path: folder, ...options } })
-    )
-  }
-
-  return Promise.reject(new Error('This Desktop build cannot create worktrees.'))
+    return { branch: String(res.branch || ''), path: String(res.path || '') }
+  })
 }
 
 function openIssueDraft({ folder, issue, owner, repo }) {
@@ -5747,10 +5731,10 @@ function GitGraphView({ data, error, folder, loading, onOpenCommit }) {
 
 // The worktree step shared by both menus: the git action stops at a created
 // checkout, the session door carries on into a new session there. A prefilled
-// name and base are enough, since worktrees are core's `git worktree add -b`
-// under `<repo>/.worktrees/`, not something this plugin reimplements. An
-// existing branch is checked out as it is; a branch the clone does not have
-// starts from the base shown here.
+// name and base are enough, since worktrees are the dashboard backend's `git
+// worktree add -b` under `<mainRoot>/.worktrees/`, not something this renderer
+// reimplements. An existing branch is checked out as it is; a branch the clone
+// does not have starts from the base shown here.
 function WorktreeDialog({ folder, row, onClose, onCreated }) {
   const exists = Boolean(row.local)
   const [name, setName] = useState(row.name)

@@ -97,12 +97,15 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 PLUGIN_NAME = "project-command-center"
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.4.1"
 GIT_TIMEOUT = 5.0
 # A checkout is the one git call that can legitimately take minutes: a large tree,
 # an LFS smudge, a slow disk. Killing it mid-run leaves a half-moved work tree and
 # a stale index.lock, so the switch gets its own budget instead of GIT_TIMEOUT.
 SWITCH_TIMEOUT = 120.0
+# `git worktree add` copies a checkout the same way `switch` moves one, so it gets the
+# same budget for the same reason: a killed add leaves a half-populated directory behind.
+WORKTREE_TIMEOUT = 120.0
 GH_TIMEOUT = 15.0  # the GraphQL PR pass is the slow gh call; everything else is under a second
 HTTP_TIMEOUT = 10.0
 REPO_TTL = 20.0
@@ -2970,6 +2973,212 @@ async def branch_switch(payload: dict[str, Any] = Body(default={})) -> dict[str,
             "previous_sha": previous_sha, "detached": False,
             "tracked": None if local_code == 0 else f"origin/{branch}",
             "warning": warning, "dirty": dirty}
+
+
+# --- Worktrees ---------------------------------------------------------------
+#
+# The Desktop half used to reach core's preload bridge for these two calls, which
+# a community plugin may not do. The same git, and the same guards, live here
+# instead: a fixed argv, the child env allowlist and `_switch_refusal` shapes, so
+# the renderer only needs ctx.rest.
+
+def _sanitize_branch(name: str) -> str:
+    """A git-ref-safe branch name, or "" when nothing usable is left.
+
+    The rules are core's ``sanitizeBranch`` in the Desktop worktree module: spaces
+    become ``-``, anything outside ``[A-Za-z0-9_./-]`` goes, runs of ``-``, ``/``
+    and ``.`` collapse, and leading/trailing punctuation is trimmed.
+    """
+    text = re.sub(r"\s+", "-", str(name or ""))
+    text = re.sub(r"[^A-Za-z0-9_./-]", "", text)
+    text = re.sub(r"-{2,}", "-", text)
+    text = re.sub(r"/{2,}", "/", text)
+    text = re.sub(r"\.{2,}", ".", text)
+    return re.sub(r"^[-./]+|[-./]+$", "", text)
+
+
+def _slugify(name: str) -> str:
+    """The ``.worktrees/<slug>`` directory name for *name*, or "" when empty.
+
+    Core's ``slugify`` lower-cases, folds anything outside ``[a-z0-9]`` into ``-``
+    and stops at 40 characters. Core falls back to ``work`` for an empty result;
+    here an empty slug is a refusal instead, so a name of only punctuation never
+    lands in the same directory as a real one.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").strip().lower())
+    return slug.strip("-")[:40].rstrip("-")
+
+
+def _worktree_entries(listing: str) -> list[dict[str, Any]]:
+    """Porcelain records: path, short branch (None when detached), detached, locked.
+
+    Records are separated by a blank line, and the first one is the main worktree,
+    which is the only way to name it: ``rev-parse --show-toplevel`` answers with the
+    linked worktree when it runs inside one.
+    """
+    rows: list[dict[str, Any]] = []
+    current: Optional[dict[str, Any]] = None
+    for line in listing.splitlines():
+        if not line.strip():
+            if current:
+                rows.append(current)
+                current = None
+            continue
+        if line.startswith("worktree "):
+            if current:
+                rows.append(current)
+            current = {"path": line[len("worktree "):].strip(), "branch": None,
+                       "detached": False, "locked": False}
+        elif current is None:
+            continue
+        elif line.startswith("branch "):
+            current["branch"] = line[len("branch "):].strip().removeprefix("refs/heads/")
+        elif line.strip() == "detached":
+            current["detached"] = True
+        elif line.startswith("locked"):
+            current["locked"] = True
+    if current:
+        rows.append(current)
+    return rows
+
+
+async def _main_worktree_root(root: str) -> Optional[str]:
+    """The main checkout's path: the first record of ``git worktree list --porcelain``."""
+    entries = _worktree_entries(await _git(root, "worktree", "list", "--porcelain"))
+    return entries[0]["path"] if entries else None
+
+
+async def _ref_resolves(root: str, ref: str) -> bool:
+    """True when *ref* names a commit in this repository."""
+    if not ref:
+        return False
+    code, _out, _err = await _run(
+        ["git", "-C", root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        timeout=GIT_TIMEOUT)
+    return code == 0
+
+
+@router.get("/worktrees")
+async def worktrees(
+        path: str = Query(..., description="Absolute path to a folder inside the repository"),
+) -> dict[str, Any]:
+    """Every worktree of the repository containing *path*, main one first.
+
+    Answers ``{"ok": true, "worktrees": [{"path", "branch", "isMain", "detached",
+    "locked"}]}`` or ``{"ok": false, "code": "folder_missing" | "not_a_repo",
+    "error", "detail"}``. HTTP 200 for every refusal; only a malformed path is a 400.
+    """
+    try:
+        folder = _resolve_folder(path)
+    except _FolderMissing as exc:
+        return _switch_refusal("folder_missing", f"Folder not found: {exc.path}", exc.path)
+    try:
+        listing = await _git(str(folder), "worktree", "list", "--porcelain")
+    except TimeoutError as exc:
+        return _switch_refusal("upstream_error", f"git did not answer for {folder}.", str(exc))
+    except _GitError as exc:
+        return _switch_refusal("not_a_repo", f"{folder} is not inside a git work tree.",
+                               str(exc))
+    entries = _worktree_entries(listing)
+    if not entries:
+        return _switch_refusal("not_a_repo", f"{folder} is not inside a git work tree.",
+                               f"git -C {folder} worktree list --porcelain")
+    return {"ok": True, "worktrees": [
+        {"path": entry["path"], "branch": entry["branch"], "isMain": index == 0,
+         "detached": entry["detached"], "locked": entry["locked"]}
+        for index, entry in enumerate(entries)]}
+
+
+@router.post("/worktree")
+async def create_worktree(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Create a worktree at ``<mainRoot>/.worktrees/<slug>``, with a fixed argv.
+
+    ``{"path": folder, "branch": name, "name": slug?, "base": ref?}`` answers
+    ``{"ok": true, "path", "branch"}`` or ``{"ok": false, "code": ...}`` with one of
+    ``folder_missing``, ``not_a_repo``, ``bad_branch``, ``bad_slug``,
+    ``worktree_exists``, ``branch_checked_out``, ``unknown_base``,
+    ``worktree_failed`` or ``upstream_error``. An existing local branch is checked
+    out as it is; otherwise a branch is made from ``base``, defaulting to
+    ``origin/<branch>`` only when that ref resolves. Nothing is forced, nothing is
+    reused and nothing is removed. HTTP 200 for every refusal; only a malformed
+    path is a 400.
+    """
+    raw_path = str(payload.get("path") or "").strip()
+    try:
+        folder = _resolve_folder(raw_path)
+    except _FolderMissing as exc:
+        return _switch_refusal("folder_missing", f"Folder not found: {exc.path}", exc.path)
+
+    branch = _sanitize_branch(str(payload.get("branch") or payload.get("name") or ""))
+    if not branch:
+        return _switch_refusal("bad_branch", "The branch name is empty after sanitizing.")
+    slug = _slugify(str(payload.get("name") or branch))
+    if not slug:
+        return _switch_refusal("bad_slug", "The worktree name is empty after sanitizing.")
+
+    root: Optional[str] = None
+    try:
+        root = await _main_worktree_root(str(folder))
+    except TimeoutError as exc:
+        return _switch_refusal("upstream_error", f"git did not answer for {folder}.", str(exc))
+    except _GitError as exc:
+        return _switch_refusal("not_a_repo", f"{folder} is not inside a git work tree.",
+                               str(exc))
+    if not root:
+        return _switch_refusal("not_a_repo", f"{folder} is not inside a git work tree.",
+                               f"git -C {folder} worktree list --porcelain")
+
+    target = Path(root) / ".worktrees" / slug
+    try:
+        code, _out, _err = await _run(
+            ["git", "-C", root, "check-ref-format", "--branch", branch], timeout=GIT_TIMEOUT)
+        if code != 0:
+            return _switch_refusal("bad_branch", "The branch name is not valid.", branch)
+
+        if target.exists() or target.is_symlink():
+            return _switch_refusal(
+                "worktree_exists", f"A worktree directory already exists at {target}.",
+                str(target))
+
+        listing = await _git(root, "worktree", "list", "--porcelain")
+        for entry in _worktree_entries(listing):
+            if entry["branch"] == branch:
+                return _switch_refusal(
+                    "branch_checked_out",
+                    f"The branch is checked out in another worktree: {entry['path']}",
+                    entry["path"], worktree=entry["path"])
+
+        local_code, _local_out, _local_err = await _run(
+            ["git", "-C", root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            timeout=GIT_TIMEOUT)
+        if local_code == 0:
+            argv = ["git", "-C", root, "worktree", "add", str(target), branch]
+        else:
+            base = _sanitize_branch(str(payload.get("base") or ""))
+            if not base and await _ref_resolves(root, f"origin/{branch}"):
+                base = f"origin/{branch}"
+            if not await _ref_resolves(root, base):
+                return _switch_refusal(
+                    "unknown_base",
+                    f"The branch {branch} is not in this clone and no base ref resolves.",
+                    base or f"origin/{branch}")
+            argv = ["git", "-C", root, "worktree", "add", "-b", branch, str(target), base]
+
+        code, _out, err = await _run(argv, timeout=WORKTREE_TIMEOUT)
+        if code != 0:
+            return _switch_refusal("worktree_failed", _git_line(err),
+                                   "git worktree add exited non-zero", branch=branch)
+        if not target.is_dir():
+            return _switch_refusal("worktree_failed", "git did not create the worktree.",
+                                   str(target))
+    except TimeoutError as exc:
+        return _switch_refusal("upstream_error", f"git did not answer for {folder}.", str(exc))
+    except _GitError as exc:
+        return _switch_refusal("upstream_error", f"git could not read {folder}.", str(exc))
+
+    _CACHE.pop(("repo", root), None)
+    _CACHE.pop(("repo", str(folder)), None)
+    return {"ok": True, "path": str(target), "branch": branch}
 
 
 # --- Routes -----------------------------------------------------------------

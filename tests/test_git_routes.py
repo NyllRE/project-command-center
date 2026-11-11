@@ -255,7 +255,7 @@ def main() -> int:
     client = TestClient(app)
 
     section("version and codes")
-    check("PLUGIN_VERSION is 0.4.0", api.PLUGIN_VERSION == "0.4.0", api.PLUGIN_VERSION)
+    check("PLUGIN_VERSION is 0.4.1", api.PLUGIN_VERSION == "0.4.1", api.PLUGIN_VERSION)
     check("empty_repo is a failure code", "empty_repo" in api.FAILURE_CODES)
     check("bad_sha is a failure code", "bad_sha" in api.FAILURE_CODES)
 

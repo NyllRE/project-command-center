@@ -8,15 +8,17 @@ against the project folder's own origin remote, and nothing else.
   * ``pre_llm_call``   read only. The card this session works in, one line per part, at most 400
     characters, injected into the turn's user message. The lane named is the session's own when it
     has one, else the project's. No project, no injection. Three primary-key lookups, never a scan
-    of the board.
+    of the board. Honours a kill file — ``card_context.off`` in the plugin's data directory —
+    checked on every call.
   * ``post_tool_call`` after a ``terminal`` call that actually ran ``gh pr create`` and whose result
     printed a ``github.com/<owner>/<repo>/pull/<n>`` URL: records that PR on the session's link row,
     then moves that session's lane to ``review`` when it was unset, ``backlog`` or ``active``, and
     moves the project's lane the same way.
 
 Both fail open: every failure is a logged ``None``, because a hook that raises must never cost a
-turn. ``post_tool_call`` additionally honours a kill file — ``auto_link.off`` in the plugin's data
-directory — checked on every call so switching auto-link off needs no restart.
+turn. Each hook additionally honours its own kill file in the plugin's data directory —
+``card_context.off`` for the injection, ``auto_link.off`` for auto-link — checked on every call so
+switching one off needs no restart.
 
 Resolution follows the session's ``link`` row (``use_cwd=False``), walking the compression lineage
 when the runtime session id is newer than the id the Desktop stored the row under. The row's
@@ -42,6 +44,7 @@ log = logging.getLogger(__name__)
 
 PLUGIN_NAME = "project-command-center"
 KILL_FILENAME = "auto_link.off"
+CARD_KILL_FILENAME = "card_context.off"
 MAX_CONTEXT = 400
 LANES = "backlog, active, review, blocked, done"
 AUTO_STATUS = "review"
@@ -88,11 +91,21 @@ def _store() -> Any:
     return _STORE
 
 
-def kill_file() -> Path:
-    """``<hermes home>/plugin-data/project-command-center/auto_link.off`` for the active profile."""
+def _plugin_data_dir() -> Path:
+    """``<hermes home>/plugin-data/project-command-center`` for the active profile."""
     from plugins.plugin_storage import plugin_data_dir
 
-    return plugin_data_dir(PLUGIN_NAME) / KILL_FILENAME
+    return plugin_data_dir(PLUGIN_NAME)
+
+
+def kill_file() -> Path:
+    """``<hermes home>/plugin-data/project-command-center/auto_link.off`` for the active profile."""
+    return _plugin_data_dir() / KILL_FILENAME
+
+
+def card_kill_file() -> Path:
+    """``card_context.off`` beside ``auto_link.off``: stops the per-turn card injection."""
+    return _plugin_data_dir() / CARD_KILL_FILENAME
 
 
 def _killed() -> bool:
@@ -105,6 +118,20 @@ def _killed() -> bool:
         return kill_file().exists()
     except Exception:
         log.debug("%s: kill file unreadable, treating auto-link as off", PLUGIN_NAME, exc_info=True)
+        return True
+
+
+def _card_killed() -> bool:
+    """True when the card injection is switched off. Same rule as ``_killed``: no cache.
+
+    An unresolvable data directory counts as off, so a turn is never given context a kill
+    switch could have removed.
+    """
+    try:
+        return card_kill_file().exists()
+    except Exception:
+        log.debug("%s: card kill file unreadable, treating card context as off", PLUGIN_NAME,
+                  exc_info=True)
         return True
 
 
@@ -172,6 +199,8 @@ def _is_home_bucket(project: dict[str, Any]) -> bool:
 def pre_llm_call(**kwargs: Any) -> Optional[dict[str, str]]:
     """The card this session works in, or ``None``. Read only: one project, one turn."""
     try:
+        if _card_killed():
+            return None
         session_id = str(kwargs.get("session_id") or "").strip()
         if not session_id:
             return None
@@ -246,6 +275,16 @@ def _tool_failed(payload: dict[str, Any], text: str) -> bool:
 
 _REMOTE_RE = re.compile(r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE)
 
+# The same child allowlist the dashboard backend gives its git calls: locale, PATH, HOME and
+# git's own config paths. A credential variable in this process must not reach the child.
+_GIT_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME",
+                 "SSH_AUTH_SOCK", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
+
+
+def _git_env() -> dict[str, str]:
+    """A child environment by allowlist, never ``os.environ`` wholesale."""
+    return {key: os.environ[key] for key in _GIT_ENV_KEYS if key in os.environ}
+
 
 def _project_remote(store: Any, project_id: str) -> str:
     """``owner/repo`` from the project's own folder, or ``""`` when it cannot be read.
@@ -269,7 +308,7 @@ def _project_remote(store: Any, project_id: str) -> str:
         try:
             done = subprocess.run(
                 ["git", "-C", path, "config", "--get", "remote.origin.url"],
-                capture_output=True, text=True, timeout=3.0)
+                capture_output=True, text=True, timeout=3.0, env=_git_env())
         except Exception:
             continue
         match = _REMOTE_RE.search((done.stdout or "").strip())

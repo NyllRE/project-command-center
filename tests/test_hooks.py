@@ -310,6 +310,30 @@ def main() -> int:
     check("removing the kill file re-enables without restart", link("s-killed").get("pr") == 42
           and lane() == "review" and len(events) == 1)
 
+    section("pre_llm_call / card kill file present")
+    card_kill = hooks.card_kill_file()
+    card_kill.write_text("card context off\n", encoding="utf-8")
+    print(f"  kill file:      {card_kill} (exists={card_kill.exists()})")
+    suppressed = hooks.pre_llm_call(session_id="s-live")
+    print(f"  with kill file  {suppressed!r}")
+    check("card_context.off suppresses the injection", suppressed is None, repr(suppressed))
+    check("it is a separate file from auto_link.off",
+          card_kill.name == hooks.CARD_KILL_FILENAME and card_kill != hooks.kill_file(),
+          str(card_kill))
+    reset("s-card")
+    store.set_link("s-card", "pcc", repo=repo, issue=7, title=title)
+    hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},
+                         result=f"{url}\n", session_id="s-card")
+    print(f"  auto-link       pr={link('s-card').get('pr')} lane={lane()} events={len(events)}")
+    check("auto-link still works while the card kill file exists",
+          link("s-card").get("pr") == 42 and lane() == "review" and len(events) == 1,
+          f"pr={link('s-card').get('pr')} lane={lane()}")
+    card_kill.unlink(missing_ok=True)
+    back = hooks.pre_llm_call(session_id="s-live")
+    print(f"  kill removed    {bool(back)}")
+    check("removing it restores the injection without restart",
+          "Board:" in (back or {}).get("context", ""), repr(back))
+
     section("post_tool_call / unlinked session")
     events.clear()
     hooks.post_tool_call(tool_name="terminal", args={"command": "gh pr create --fill"},

@@ -56,6 +56,22 @@ def sandbox_home() -> Path:
     return home
 
 
+def _scratch_home(value: str | None) -> bool:
+    """True when *value* is a HERMES_HOME a suite may write to.
+
+    An inherited ``HERMES_HOME=~/.hermes`` is the common case inside Hermes, and it
+    must not survive: the suites would write board rows and kill files into real
+    plugin data. Anything that is not the real home is treated as the caller's
+    deliberate choice and kept.
+    """
+    if not value:
+        return False
+    try:
+        return Path(value).expanduser().resolve() != (Path.home() / ".hermes").resolve()
+    except OSError:
+        return False
+
+
 def ensure() -> Path | None:
     root = hermes_root()
     if root is None:
@@ -67,7 +83,7 @@ def ensure() -> Path | None:
     entry = str(root)
     if entry not in sys.path:
         sys.path.insert(0, entry)
-    if not os.environ.get("HERMES_HOME"):
+    if not _scratch_home(os.environ.get("HERMES_HOME")):
         os.environ["HERMES_HOME"] = str(sandbox_home())
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     return root
