@@ -23,6 +23,8 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | Route | Body | Effect |
 |---|---|---|
 | `POST /branch/switch?path=<abs>` | `{branch}` | checks the branch out in the project's main folder |
+| `GET /worktrees?path=<abs>` | none | `<mainRoot>`, `branch`, `isMain`, `detached`, `locked` per worktree, from `git worktree list --porcelain` |
+| `POST /worktree` | `{path, branch, name?, base?}` | makes `<mainRoot>/.worktrees/<slug>` with `git worktree add` |
 | `POST /github/issue/{n}/comment` | `{body}` | comments on an issue, text on stdin to `gh` |
 | `POST /github/pr/{n}/comment` | `{body}` | comments on a PR conversation |
 | `POST /github/issue/{n}/state` | `{state}` | opens or closes an issue |
@@ -33,6 +35,8 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | `POST /board/seed` | `{}` | seeds project rows from Hermes Projects |
 
 `/branch/switch` refuses rather than forcing. Codes: `switched`, `already_on`, `dirty_tree`, `unknown_branch`, `bad_branch`, `not_a_repo`, `inside_root`, `not_main_worktree`, `checked_out_elsewhere`, `operation_in_progress`, `detached_unreachable`, `switch_failed`. Untracked files alone are allowed and reported as a warning.
+
+`/worktree` creates and never repairs. Refusal codes: `folder_missing`, `not_a_repo`, `bad_branch`, `bad_slug`, `worktree_exists`, `branch_checked_out`, `unknown_base`, `worktree_failed`, `upstream_error`. The target is always `<mainRoot>/.worktrees/<slug>`, where mainRoot is the first record of `git worktree list --porcelain`; a directory already on disk is a refusal, never a reuse, and the branch is checked out as it is when it exists locally or made from `base` (defaulting to `origin/<branch>` only when that ref resolves).
 
 ## Caching
 

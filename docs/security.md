@@ -12,7 +12,7 @@ Short version: this plugin reads your projects and your GitHub work, writes only
 
 | Where | What |
 |---|---|
-| your repositories | nothing, with one exception: `POST /branch/switch` checks out the branch you pick in the project's main folder. It refuses on a dirty tree, a merge or rebase in progress, a branch already checked out in another worktree, or a detached HEAD with unreachable commits. It never stashes, discards or forces, and switching runs git's own hooks exactly as a checkout you run yourself would |
+| your repositories | two explicit writes, both asked for from the UI. `POST /branch/switch` checks out the branch you pick in the project's main folder, refusing on a dirty tree, a merge or rebase in progress, a branch already checked out in another worktree, or a detached HEAD with unreachable commits. `POST /worktree` creates `<mainRoot>/.worktrees/<slug>`, and a branch only when the name is not already in the clone. Neither stashes, discards, forces, reuses a directory or removes anything, and both run git's own hooks exactly as the same command in your shell would |
 | GitHub | a comment on an issue or PR, and open or close on an issue or PR. Nothing is deleted, labelled, assigned, merged or edited. Each write runs as the `gh` CLI account you authenticated, with the body on stdin |
 | Hermes home | `plugin-data/project-command-center/board.db`, a SQLite file owned by the active profile: project lanes, session lanes, and session to issue/PR links. Nothing leaves the machine and no credential is stored there |
 
