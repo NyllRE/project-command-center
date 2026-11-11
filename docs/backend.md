@@ -15,6 +15,7 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | `GET /github/refs?path=<abs>&numbers=1,2,3` | `refs` keyed by number, up to 50 in one batched GraphQL call |
 | `GET /github/counts?path=<abs>&path=<abs>...` | open issue and PR counts for up to 50 folders in one query, one alias per repository |
 | `GET /icon?path=<abs>&refresh=0` | the best mark for a project folder: a local favicon or logo, then a declared homepage favicon or the GitHub owner avatar, then a stack glyph |
+| `GET /worktrees?path=<abs>` | `<mainRoot>`, `branch`, `isMain`, `detached`, `locked` per worktree, from `git worktree list --porcelain` |
 | `GET /board` | `statuses`, `links`, `projects`: the board state the Desktop half renders |
 | `GET /diagnose` | why a project reads as it does: auth route, which folders resolved, what was skipped |
 
@@ -23,7 +24,6 @@ The plugin mounts one FastAPI router under `/api/plugins/project-command-center/
 | Route | Body | Effect |
 |---|---|---|
 | `POST /branch/switch?path=<abs>` | `{branch}` | checks the branch out in the project's main folder |
-| `GET /worktrees?path=<abs>` | none | `<mainRoot>`, `branch`, `isMain`, `detached`, `locked` per worktree, from `git worktree list --porcelain` |
 | `POST /worktree` | `{path, branch, name?, base?}` | makes `<mainRoot>/.worktrees/<slug>` with `git worktree add` |
 | `POST /github/issue/{n}/comment` | `{body}` | comments on an issue, text on stdin to `gh` |
 | `POST /github/pr/{n}/comment` | `{body}` | comments on a PR conversation |

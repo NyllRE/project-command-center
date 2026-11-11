@@ -24,12 +24,13 @@ Short version: this plugin reads your projects and your GitHub work, writes only
 
 ## Kill files
 
-Both are checked on every call, so they take effect without a restart.
+All three are checked on every call, so they take effect without a restart.
 
 | File | Effect |
 |---|---|
 | `<hermes home>/plugin-data/project-command-center/icons_remote.off` | no remote icon fetch at all, local disk or the stack glyph only |
 | `<hermes home>/plugin-data/project-command-center/auto_link.off` | the PR auto-link hook writes nothing |
+| `<hermes home>/plugin-data/project-command-center/card_context.off` | the per-turn card injection sends nothing, so a turn starts with no board context |
 
 ## Agent tools and hooks
 

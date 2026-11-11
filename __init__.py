@@ -36,7 +36,7 @@ from typing import Any, Callable, Optional
 log = logging.getLogger(__name__)
 
 PLUGIN_NAME = "project-command-center"
-PLUGIN_VERSION = "0.4.1"
+PLUGIN_VERSION = "0.4.2"
 TOOLSET = "project_command_center"
 
 _STORE_LOCK = threading.Lock()

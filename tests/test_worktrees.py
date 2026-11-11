@@ -369,6 +369,18 @@ def main() -> int:
     check("no argv token is an empty string",
           all(isinstance(item, str) and item for row in seen for item in row))
 
+    # An @ inside a ref name is legal git (`user@host`): sanitizing must keep it
+    # rather than silently renaming a real remote branch into one that is not there.
+    check("an @ inside a branch name survives sanitizing",
+          api._sanitize_branch("user@host") == "user@host",
+          api._sanitize_branch("user@host"))
+    check("a leading dash still cannot reach git",
+          not api._sanitize_branch("--upload-pack=touch").startswith("-"),
+          api._sanitize_branch("--upload-pack=touch"))
+    check("shell metacharacters never survive",
+          api._sanitize_branch("x; touch /tmp/pwned") == "x-touch-/tmp/pwned",
+          api._sanitize_branch("x; touch /tmp/pwned"))
+
     print(f"\n{len(FAILURES)} failure(s) in {time.monotonic() - started:.1f}s")
     if FAILURES:
         for name in FAILURES:

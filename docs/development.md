@@ -48,6 +48,7 @@ That is the whole story. It finds the Hermes venv python, runs every suite, and 
 | `test_session_status.py` | the link-row lane migration, session scope, project fallback |
 | `test_git_routes.py` | graph and diff routes, including a hostile repository whose config points at a script |
 | `test_branch_switch.py` | every refusal code, exercised against real repositories |
+| `test_worktrees.py` | the porcelain parser, every refusal code, and a real `git worktree add` under `.worktrees/` |
 | `test_icons.py` | search order, the `.git` fence, depth and count caps |
 | `test_avatars.py` | host allow-list, size normalisation, bot flags |
 | `test_github_states.py` | the `/github` state contract, open, closed, merged and draft |

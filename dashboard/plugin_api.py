@@ -97,7 +97,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 PLUGIN_NAME = "project-command-center"
-PLUGIN_VERSION = "0.4.1"
+PLUGIN_VERSION = "0.4.2"
 GIT_TIMEOUT = 5.0
 # A checkout is the one git call that can legitimately take minutes: a large tree,
 # an LFS smudge, a slow disk. Killing it mid-run leaves a half-moved work tree and
@@ -2987,10 +2987,13 @@ def _sanitize_branch(name: str) -> str:
 
     The rules are core's ``sanitizeBranch`` in the Desktop worktree module: spaces
     become ``-``, anything outside ``[A-Za-z0-9_./-]`` goes, runs of ``-``, ``/``
-    and ``.`` collapse, and leading/trailing punctuation is trimmed.
+    and ``.`` collapse, and leading/trailing punctuation is trimmed. ``@`` stays:
+    it is legal inside a ref name (``user@host``), and dropping it would silently
+    rename a real branch into one that does not exist. Whatever survives still has
+    to pass ``git check-ref-format --branch`` before git sees it.
     """
     text = re.sub(r"\s+", "-", str(name or ""))
-    text = re.sub(r"[^A-Za-z0-9_./-]", "", text)
+    text = re.sub(r"[^A-Za-z0-9_./@-]", "", text)
     text = re.sub(r"-{2,}", "-", text)
     text = re.sub(r"/{2,}", "/", text)
     text = re.sub(r"\.{2,}", ".", text)
@@ -3137,7 +3140,7 @@ async def create_worktree(payload: dict[str, Any] = Body(default={})) -> dict[st
 
         if target.exists() or target.is_symlink():
             return _switch_refusal(
-                "worktree_exists", f"A worktree directory already exists at {target}.",
+                "worktree_exists", f"A file or directory already exists at {target}.",
                 str(target))
 
         listing = await _git(root, "worktree", "list", "--porcelain")
