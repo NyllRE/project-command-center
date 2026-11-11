@@ -1,6 +1,6 @@
 name: project-command-center
 repo: https://github.com/NyllRE/project-command-center
-sha: 707d01ca0cff32225e0a59e8221ba232bc6a030a
+sha: 8acc88af76082039f87de107eaed20726774c5ee
 title: Project Command Center
 description: >-
   A board for every Hermes Project: lane, live sessions, token spend, git branch and
@@ -22,16 +22,16 @@ maintainer: NyllRE
 tier: community
 category: desktop
 docs_url: https://github.com/NyllRE/project-command-center#readme
-version: "0.4.0"
+version: "0.4.1"
 requires_hermes: ">=0.23.0"
-image: https://raw.githubusercontent.com/NyllRE/project-command-center/707d01ca0cff32225e0a59e8221ba232bc6a030a/docs/covers/cover-final.png
+image: https://raw.githubusercontent.com/NyllRE/project-command-center/8acc88af76082039f87de107eaed20726774c5ee/docs/covers/cover-final.png
 screenshots:
-  - https://raw.githubusercontent.com/NyllRE/project-command-center/707d01ca0cff32225e0a59e8221ba232bc6a030a/docs/screenshots/board.png
-  - https://raw.githubusercontent.com/NyllRE/project-command-center/707d01ca0cff32225e0a59e8221ba232bc6a030a/docs/screenshots/composer.png
-  - https://raw.githubusercontent.com/NyllRE/project-command-center/707d01ca0cff32225e0a59e8221ba232bc6a030a/docs/screenshots/project.png
-  - https://raw.githubusercontent.com/NyllRE/project-command-center/707d01ca0cff32225e0a59e8221ba232bc6a030a/docs/screenshots/pull-requests.png
-  - https://raw.githubusercontent.com/NyllRE/project-command-center/707d01ca0cff32225e0a59e8221ba232bc6a030a/docs/screenshots/issue-modal.png
-  - https://raw.githubusercontent.com/NyllRE/project-command-center/707d01ca0cff32225e0a59e8221ba232bc6a030a/docs/screenshots/graph.png
+  - https://raw.githubusercontent.com/NyllRE/project-command-center/8acc88af76082039f87de107eaed20726774c5ee/docs/screenshots/board.png
+  - https://raw.githubusercontent.com/NyllRE/project-command-center/8acc88af76082039f87de107eaed20726774c5ee/docs/screenshots/composer.png
+  - https://raw.githubusercontent.com/NyllRE/project-command-center/8acc88af76082039f87de107eaed20726774c5ee/docs/screenshots/project.png
+  - https://raw.githubusercontent.com/NyllRE/project-command-center/8acc88af76082039f87de107eaed20726774c5ee/docs/screenshots/pull-requests.png
+  - https://raw.githubusercontent.com/NyllRE/project-command-center/8acc88af76082039f87de107eaed20726774c5ee/docs/screenshots/issue-modal.png
+  - https://raw.githubusercontent.com/NyllRE/project-command-center/8acc88af76082039f87de107eaed20726774c5ee/docs/screenshots/graph.png
 platforms: []
 capabilities:
   provides_tools:
