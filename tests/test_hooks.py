@@ -114,10 +114,15 @@ def main() -> int:
     text = (got or {}).get("context", "")
     print(f"  len():  {len(text)}")
     check("returns {'context': str}", isinstance(got, dict) and isinstance(text, str))
-    check("len(context) <= 400", len(text) <= 400, str(len(text)))
+    check("len(context) <= 520", len(text) <= 520, str(len(text)))
     for needle in ("Project Command Center", "active", "#7", title, "no PR yet",
                    'Closes #<issue>', "pcc_set_status", "backlog, active, review, blocked, done"):
         check(f"names {needle!r}", needle in text)
+    # The inline card claim only renders while this plugin is loaded AND the
+    # model is told the name, so the instruction line is part of the feature:
+    # a plugin that registers `pcc-gh` while the turn context names nothing
+    # draws every reference as raw prose and reports no error anywhere.
+    check("names the ::pcc-gh directive", "::pcc-gh{" in text)
 
     section("pre_llm_call / PR already on the link row")
     store.set_link("s-create", "pcc", pr=42, pr_url=f"https://github.com/{repo}/pull/42")
@@ -130,9 +135,23 @@ def main() -> int:
     got = hooks.pre_llm_call(session_id="s-live")
     print(f"  len():  {len((got or {}).get('context', ''))}")
     print(f"  return: {(got or {}).get('context')!r}")
-    check("len(context) <= 400 with an 800 char title", len((got or {}).get("context", "")) <= 400,
-          str(len((got or {}).get("context", ""))))
+    long_text = (got or {}).get("context", "")
+    check("len(context) <= 520 with an 800 char title", len(long_text) <= 520, str(len(long_text)))
+    check("a long title is truncated, not dropped", "Issue: #7 A very long issue title" in long_text,
+          long_text.splitlines()[1] if long_text else "")
     store.set_link("s-live", "pcc", title=title)
+
+    section("pre_llm_call / a long label never cuts the instruction")
+    # The directive line is the ONLY place the model is told how to write a
+    # reference card. A cut that lands on it disables every inline card in the
+    # session with nothing in any log to say so.
+    long_label = ("A very long project label " * 12).strip()
+    cut = hooks._context(long_label, "active", 7, "a title that does not fit either", None)
+    print(f"  len():  {len(cut)}")
+    check("_context stays inside the cap", len(cut) <= hooks.MAX_CONTEXT, str(len(cut)))
+    check("_context keeps the directive line whole", '::pcc-gh{url="<link>"}' in cut)
+    check("_context ends with the instruction it started", cut.rstrip().endswith("renders as a card."))
+    check("_context still names the project, truncated", cut.startswith("Board: A very long project label"))
 
     section("pre_llm_call / no injection, never raises")
     cases: list[tuple[str, dict]] = [

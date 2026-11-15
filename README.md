@@ -53,6 +53,14 @@ The whole issue, not a summary of it: markdown body, labels, assignees, and the 
 
 ![A reference chip with its preview](./docs/screenshots/ref-preview.png)
 
+### References arrive as cards, in the chat itself
+
+When the agent references an issue or a pull request in its own reply, the reference lands as a small card inside the message: the GitHub state colour, the number, the title, who opened it and how long ago. Click it and the same detail view opens in place, thread and all. Follow a link inside it and you get a back chevron, so a chain of references does not lose your place.
+
+A comment permalink is a card too: `#issuecomment-…` quotes the comment and opens the thread scrolled to it, with a brief outline on the line it landed on. Review-comment anchors are not in the thread read, so those cards name the pull request and say so.
+
+The agent writes that card itself (`::pcc-gh{url="…"}`, a transcript directive this plugin registers), and it is told how to on every turn. A plain link stays a plain link, so nothing is invented and nothing is guessed.
+
 ## History that looks like history
 
 A commit graph with real lanes. Fork, merge, track across branches, and open any commit to read its diff, files and line changes.
@@ -65,7 +73,11 @@ Each branch row gives you a session, not a chore. Start one in a worktree, or ch
 
 ![Every issue row is a session door](./docs/screenshots/issues.png)
 
-Sessions carry a lane: backlog, active, review, blocked, done. The board summarises them per project, so "who is on review" is a glance instead of a hunt.
+A running session wears the app's travelling ring on its card, and while you drag one the lane under the cursor says "Release to drop in <lane>" before you let go.
+
+Archived sessions are not silent: the bottom of the board tells you how many are hidden, and one click brings the newest 300 back into their lanes and project columns, each marked `Archived`. That count is why a board can look emptier than your session list: the gateway never returns archived rows, so the plugin reads them from its own state database.
+
+Sessions carry a lane: unfiled, backlog, active, review, blocked, done or canceled. A merged PR or a completed issue lands in done, a closed one in canceled, and a session nothing claims sits in unfiled. The board summarises them per project, so "who is on review" is a glance instead of a hunt.
 
 ## What it never does
 

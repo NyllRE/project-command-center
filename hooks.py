@@ -5,8 +5,10 @@ either one touches are the SQLite board and (on a link-row miss) the session dat
 ``board_store.py``. ``post_tool_call`` may run one fixed argv ``git config`` read to check a PR URL
 against the project folder's own origin remote, and nothing else.
 
-  * ``pre_llm_call``   read only. The card this session works in, one line per part, at most 400
-    characters, injected into the turn's user message. The lane named is the session's own when it
+  * ``pre_llm_call``   read only. The card this session works in, one line per part, at most
+    ``MAX_CONTEXT`` characters, injected into the turn's user message. The last line tells the
+    model how to write a GitHub reference card (``::pcc-gh{...}``), so the instruction is never
+    the part that gets cut. The lane named is the session's own when it
     has one, else the project's. No project, no injection. Three primary-key lookups, never a scan
     of the board. Honours a kill file — ``card_context.off`` in the plugin's data directory —
     checked on every call.
@@ -45,7 +47,7 @@ log = logging.getLogger(__name__)
 PLUGIN_NAME = "project-command-center"
 KILL_FILENAME = "auto_link.off"
 CARD_KILL_FILENAME = "card_context.off"
-MAX_CONTEXT = 400
+MAX_CONTEXT = 520
 LANES = "backlog, active, review, blocked, done"
 AUTO_STATUS = "review"
 AUTO_FROM = ("backlog", "active")
@@ -146,19 +148,42 @@ def _broadcast(project_id: str, pr: int) -> None:
 
 
 def _context(label: str, lane: str, issue: Any, title: str, pr: Any) -> str:
-    """At most ``MAX_CONTEXT`` characters naming the card, its work item and what to do next."""
-    head = f"Board: {label} — {lane}"
+    """The card, its work item, and what to do next, inside ``MAX_CONTEXT``.
+
+    The cut comes out of the NAMES, never out of the instruction. The last line is the only place the
+    model is told how to write a GitHub reference card, so a long project label or issue title that
+    pushed it past the cap would silently disable every inline card in that session: the plugin would
+    still claim the directive, and nothing would ever be written for it to claim.
+    """
     pr_line = f"PR: #{pr}" if pr else "PR: no PR yet"
     tail = (f'Put "Closes #<issue>" in the PR body. Move the card with pcc_set_status '
-            f"(lanes: {LANES}).")
-    if issue:
-        prefix = f"Issue: #{issue} "
-        room = MAX_CONTEXT - len(head) - len(pr_line) - len(tail) - 3 - len(prefix)
-        body = title if len(title) <= room else title[: max(room - 1, 0)] + "…"
-        issue_line = f"{prefix}{body}".rstrip()
-    else:
-        issue_line = "Issue: no issue linked"
-    text = f"{head}\n{issue_line}\n{pr_line}\n{tail}"
+            f"(lanes: {LANES}). "
+            f'Referencing an issue or PR: put ::pcc-gh{{url="<link>"}} on its own line so it '
+            f"renders as a card.")
+    suffix = f"{pr_line}\n{tail}"
+
+    def compose(name: str, issue_line: str) -> str:
+        return f"Board: {name} — {lane}\n{issue_line}\n{suffix}"
+
+    issue_line = f"Issue: #{issue}" if issue else "Issue: no issue linked"
+    if issue and title:
+        with_title = f"{issue_line} {title}".rstrip()
+        if len(compose(label, with_title)) <= MAX_CONTEXT:
+            return compose(label, with_title)
+        # The title gives way before the instruction does, but it gets to be
+        # truncated first: dropping it outright loses what the issue is about.
+        room = MAX_CONTEXT - len(compose(label, issue_line)) - 2
+        if room >= 8:
+            truncated = compose(label, f"{issue_line} {title[:room].rstrip()}…")
+            if len(truncated) <= MAX_CONTEXT:
+                return truncated
+    text = compose(label, issue_line)
+    if len(text) <= MAX_CONTEXT:
+        return text
+    # Still over: shorten the label, which is context, rather than the tail.
+    room = MAX_CONTEXT - len(compose("", issue_line))
+    name = label if len(label) <= room else label[: max(room - 1, 0)] + "…"
+    text = compose(name, issue_line)
     return text if len(text) <= MAX_CONTEXT else text[: MAX_CONTEXT - 1] + "…"
 
 

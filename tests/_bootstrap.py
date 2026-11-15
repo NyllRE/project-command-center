@@ -2,7 +2,9 @@
 
 A fresh clone has neither PYTHONPATH nor a HERMES_HOME, so each suite calls this
 first and it sorts both out: the Hermes tree goes on `sys.path`, and a throwaway
-home keeps a test run away from real plugin data.
+home keeps a test run away from real plugin data. ``TERMINAL_CWD`` is pinned to
+this repo for the same reason: the cwd-resolved cases need the folder under test,
+not the shell the run was started from.
 
 Resolution order for the Hermes tree:
   1. ``HERMES_AGENT_ROOT``
@@ -85,6 +87,10 @@ def ensure() -> Path | None:
         sys.path.insert(0, entry)
     if not _scratch_home(os.environ.get("HERMES_HOME")):
         os.environ["HERMES_HOME"] = str(sandbox_home())
+    # Same ownership for the cwd: the suites use this repo as the project folder
+    # (test_hooks proves an unlinked session in it still gets its card), while an
+    # inherited TERMINAL_CWD names the agent's shell and resolves elsewhere.
+    os.environ["TERMINAL_CWD"] = str(Path(__file__).resolve().parent.parent)
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     return root
 

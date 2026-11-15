@@ -6,7 +6,7 @@ LIVE_DIR := $(HOME)/.hermes/desktop-plugins/$(PLUGIN_ID)
 PYTHON ?= $(shell for p in "$$HERMES_PYTHON" "$$HOME/.hermes/hermes-agent/venv/bin/python"; do \
 	if [ -n "$$p" ] && [ -x "$$p" ]; then echo "$$p"; break; fi; done)
 
-PY_SUITES := test_hooks test_session_status test_git_routes test_branch_switch test_worktrees test_icons test_avatars test_github_states
+PY_SUITES := test_hooks test_session_status test_lanes test_git_routes test_branch_switch test_worktrees test_icons test_avatars test_github_states test_github_reactions test_goals test_archived_sessions
 
 .PHONY: dev validate test test-py test-js
 
@@ -26,4 +26,4 @@ test-py:
 	@set -e; for suite in $(PY_SUITES); do printf "%-22s " "$$suite"; $(PYTHON) tests/$$suite.py >/tmp/pcc-$$suite.log 2>&1 && echo ok || { echo FAILED; tail -20 /tmp/pcc-$$suite.log; exit 1; }; done
 
 test-js:
-	@node --test tests/graph_layout.test.mjs tests/github_status.test.mjs tests/session_lane.test.mjs tests/plugin_surface.test.mjs
+	@node --test tests/graph_layout.test.mjs tests/github_status.test.mjs tests/session_lane.test.mjs tests/sessions_kanban.test.mjs tests/merged_views.test.mjs tests/plugin_surface.test.mjs tests/github_reactions.test.mjs tests/review_medium.test.mjs tests/titlebar_project.test.mjs tests/project_panel.test.mjs tests/goals.test.mjs tests/gate_fixes.test.mjs tests/inline_cards.test.mjs tests/archived_sessions.test.mjs

@@ -65,3 +65,13 @@ test('the worktree helpers are the only door to those routes', () => {
   assert.equal((source.match(/\bcreateWorktree\(/g) || []).length, 2,
     'definition plus the dialog submit')
 })
+
+test('one icon everywhere: the inbox codicon', () => {
+  // The sidebar can only take a codicon name, so the page header, the titlebar
+  // button and the nav row all use the same glyph rather than two marks.
+  assert.doesNotMatch(source, /PILLAR_PATH|PillarIcon/, 'no inlined second mark')
+  assert.doesNotMatch(source, /from '@iconify|api\.iconify\.design/, 'no Iconify dependency or fetch')
+  assert.equal((source.match(/name: 'inbox'/g) || []).length, 2,
+    'the page header and the titlebar button')
+  assert.match(source, /codicon: 'inbox'/, 'the sidebar nav row')
+})

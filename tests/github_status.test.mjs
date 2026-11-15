@@ -32,7 +32,7 @@ assert.doesNotMatch(block, /^\s*export\s/m, 'status block must not export anythi
 assert.doesNotMatch(block, /(?<![\w$])jsx\(/, 'status block must not render')
 
 vm.runInThisContext(
-  `${block}\n;globalThis.__PCC_STATUS__ = { GH_STATUS_COLORS, GH_STATUS_LABELS, GH_STATUS_FILTERS, ghStatusKey, ghStatusColor, ghStatusLabel, ghStatusVariant, ghStatusLook, ghStatusBuckets, ghFilterRows }`,
+  `${block}\n;globalThis.__PCC_STATUS__ = { GH_STATUS_COLORS, GH_STATUS_LABELS, GH_STATUS_FILTERS, ghStatusKey, ghStatusLabel, ghStatusVariant, ghStatusLook, ghStatusBuckets, ghFilterRows }`,
   { filename: PLUGIN }
 )
 const S = globalThis.__PCC_STATUS__
@@ -64,14 +64,16 @@ test('the palette is GitHub dark, named once', () => {
   )
 })
 
+// The colour is read through `ghStatusLook`, the reader every row uses: the
+// standalone colour helper went with it, and this pins the mapping it served.
 test('issues colour by close reason', () => {
-  assert.equal(S.ghStatusColor('issue', openIssue), '#3fb950')
-  assert.equal(S.ghStatusColor('issue', doneIssue), '#a371f7')
-  assert.equal(S.ghStatusColor('issue', notPlannedIssue), '#f85149')
-  assert.equal(S.ghStatusColor('issue', duplicateIssue), '#f85149')
+  assert.equal(S.ghStatusLook('issue', openIssue).color, '#3fb950')
+  assert.equal(S.ghStatusLook('issue', doneIssue).color, '#a371f7')
+  assert.equal(S.ghStatusLook('issue', notPlannedIssue).color, '#f85149')
+  assert.equal(S.ghStatusLook('issue', duplicateIssue).color, '#f85149')
   // Closed with no reason is the ordinary close, so purple, never red.
-  assert.equal(S.ghStatusColor('issue', bareClosedIssue), '#a371f7')
-  assert.equal(S.ghStatusColor('issue', unknownRow), '#8b949e')
+  assert.equal(S.ghStatusLook('issue', bareClosedIssue).color, '#a371f7')
+  assert.equal(S.ghStatusLook('issue', unknownRow).color, '#8b949e')
 })
 
 test('a reason written any way still reads', () => {
@@ -82,11 +84,11 @@ test('a reason written any way still reads', () => {
 })
 
 test('pull requests colour by merge, close and draft', () => {
-  assert.equal(S.ghStatusColor('pr', openPr), '#3fb950')
-  assert.equal(S.ghStatusColor('pr', mergedPr), '#a371f7')
-  assert.equal(S.ghStatusColor('pr', closedPr), '#a371f7')
-  assert.equal(S.ghStatusColor('pr', draftPr), '#8b949e')
-  assert.equal(S.ghStatusColor('pr', unknownRow), '#8b949e')
+  assert.equal(S.ghStatusLook('pr', openPr).color, '#3fb950')
+  assert.equal(S.ghStatusLook('pr', mergedPr).color, '#a371f7')
+  assert.equal(S.ghStatusLook('pr', closedPr).color, '#a371f7')
+  assert.equal(S.ghStatusLook('pr', draftPr).color, '#8b949e')
+  assert.equal(S.ghStatusLook('pr', unknownRow).color, '#8b949e')
 })
 
 test('glyphs follow the state, issues keep one glyph', () => {
@@ -162,7 +164,7 @@ test('junk in, empty list out, never a crash', () => {
   assert.deepEqual(S.ghFilterRows('pr', null, ['open']), [])
   assert.deepEqual(S.ghFilterRows('pr', undefined, null), [])
   assert.deepEqual(S.ghFilterRows('pr', [null], ['open']), [null])
-  assert.equal(S.ghStatusColor('pr', null), S.GH_STATUS_COLORS.unknown)
-  assert.equal(S.ghStatusColor('nonsense', { state: 'open' }), S.GH_STATUS_COLORS.open)
+  assert.equal(S.ghStatusLook('pr', null).color, S.GH_STATUS_COLORS.unknown)
+  assert.equal(S.ghStatusLook('nonsense', { state: 'open' }).color, S.GH_STATUS_COLORS.open)
   assert.equal(S.ghStatusKey('issue', { state: 'closed', state_reason: 42 }), 'closed')
 })

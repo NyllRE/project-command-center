@@ -1,11 +1,14 @@
-"""Server side board state for Project Command Center: three tables in one local SQLite file.
+"""Server side board state for Project Command Center: four tables in one local SQLite file.
 
 The board used to live entirely in the Desktop half's ``ctx.storage``, so an agent could not see
 or move a project's status and a status did not survive a reinstall of the Desktop half. This
 module is the single writer of that state:
 
-  * ``status``  one row per project: backlog / active / review / blocked / done, a note, who wrote
-    it (``user``, ``agent``, ``auto``) and when.
+  * ``lanes``   the lane definitions: id, label, position, custom and system, in the order the board
+    shows them. Seeded with the seven system lanes below; a user's custom lanes live here too, and
+    every write path validates against this table instead of the seed tuple.
+  * ``status``  one row per project: a lane id, a note, who wrote it (``user``, ``agent``, ``auto``)
+    and when.
   * ``link``    one row per session: the project it works in, the issue or PR the session is
     attached to, and the session's own lane (``status``, ``note``, ``status_source`` and
     ``status_updated_at``). The Desktop reads it for the running indicator; the tools write it.
@@ -38,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -54,6 +58,16 @@ PLUGIN_NAME = "project-command-center"
 DB_FILENAME = "board.db"
 
 STATUSES = ("backlog", "active", "review", "blocked", "done")
+# The lanes every board carries, in the order they read: a session nothing claims sits in the first
+# one, so ``unfiled`` is the fallback rather than a lane somebody chose, and ``canceled`` is the
+# terminal lane a closed-not-planned item derives. They are ``system`` rows: rename and reorder are
+# fine, delete is not. ``STATUSES`` stays the project-lane vocabulary the old pickers speak.
+SEED_LANES = (("unfiled", "Unfiled"), ("backlog", "Backlog"), ("active", "Active"),
+              ("review", "Review"), ("blocked", "Blocked"), ("done", "Done"),
+              ("canceled", "Canceled"))
+SEED_LANE_IDS = tuple(lane_id for lane_id, _ in SEED_LANES)
+# A lane id is what a hook, a tool and a stored row carry, so it stays URL-safe and short.
+_LANE_ID = re.compile(r"^[a-z][a-z0-9-]{0,24}$")
 SOURCES = ("user", "agent", "auto")
 # Which card a status write lands on: the session's own lane, the project's, or auto (session when
 # a session id is given, project otherwise).
@@ -65,9 +79,19 @@ RESOLVED_BY = ("cwd", "desktop", "agent")
 
 _SCHEMA = (
     """
+CREATE TABLE IF NOT EXISTS lanes (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    custom INTEGER NOT NULL DEFAULT 0,
+    system INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+)
+""",
+    """
 CREATE TABLE IF NOT EXISTS status (
     project_id TEXT PRIMARY KEY,
-    status TEXT CHECK (status IN ('backlog', 'active', 'review', 'blocked', 'done')),
+    status TEXT,
     note TEXT,
     source TEXT CHECK (source IN ('user', 'agent', 'auto')),
     updated_at REAL
@@ -85,7 +109,7 @@ CREATE TABLE IF NOT EXISTS link (
     resolved_by TEXT,
     created_at REAL,
     updated_at REAL,
-    status TEXT CHECK (status IN ('backlog', 'active', 'review', 'blocked', 'done')),
+    status TEXT,
     note TEXT,
     status_source TEXT CHECK (status_source IN ('user', 'agent', 'auto')),
     status_updated_at REAL
@@ -108,11 +132,45 @@ CREATE TABLE IF NOT EXISTS project (
 # on the first read after an upgrade; the project lane in ``status`` is untouched.
 _MIGRATIONS = (
     ("link", "resolved_by", "TEXT"),
-    ("link", "status", "TEXT CHECK (status IN ('backlog', 'active', 'review', 'blocked', 'done'))"),
+    ("link", "status", "TEXT"),
     ("link", "note", "TEXT"),
     ("link", "status_source", "TEXT CHECK (status_source IN ('user', 'agent', 'auto'))"),
     ("link", "status_updated_at", "REAL"),
+    # Older boards predate the system/seed split: the column arriving is the one-time signal that
+    # the seven system lanes (unfiled and canceled included) have to be inserted and ordered.
+    ("lanes", "system", "INTEGER NOT NULL DEFAULT 0"),
 )
+
+# A database written before lanes were data has the five ids baked into two CHECK constraints, and
+# SQLite cannot drop a CHECK. These are the table definitions those two are rebuilt into; the lane
+# column keeps no CHECK because validity now lives in ``lanes``.
+_STATUS_REBUILD = """
+CREATE TABLE status__lanes (
+    project_id TEXT PRIMARY KEY,
+    status TEXT,
+    note TEXT,
+    source TEXT CHECK (source IN ('user', 'agent', 'auto')),
+    updated_at REAL
+)
+"""
+_LINK_REBUILD = """
+CREATE TABLE link__lanes (
+    session_id TEXT PRIMARY KEY,
+    project_id TEXT,
+    repo TEXT,
+    issue INTEGER,
+    pr INTEGER,
+    pr_url TEXT,
+    title TEXT,
+    resolved_by TEXT,
+    created_at REAL,
+    updated_at REAL,
+    status TEXT,
+    note TEXT,
+    status_source TEXT CHECK (status_source IN ('user', 'agent', 'auto')),
+    status_updated_at REAL
+)
+"""
 
 _LINK_COLUMNS = ("session_id, project_id, repo, issue, pr, pr_url, title, resolved_by, "
                  "created_at, updated_at, status, note, status_source, status_updated_at")
@@ -162,10 +220,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         try:
             for statement in _SCHEMA:
                 conn.execute(statement)
+            lane_system_added = False
             for table, column, declaration in _MIGRATIONS:
                 columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
                 if column not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+                    if table == "lanes" and column == "system":
+                        lane_system_added = True
+            _drop_lane_checks(conn)
+            _seed_lanes(conn, migrate_system=lane_system_added)
         except BaseException:
             _rollback(conn)
             _schema_ready.discard(key)
@@ -175,16 +238,84 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _tables_present(conn: sqlite3.Connection) -> bool:
-    """True when the three board tables exist. One cheap ``sqlite_master`` read per call."""
+    """True when the four board tables exist. One cheap ``sqlite_master`` read per call."""
     try:
         row = conn.execute(
             "SELECT (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'status')"
             " + (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'link')"
             " + (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'project')"
+            " + (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'lanes')"
         ).fetchone()
     except sqlite3.DatabaseError:
         return False
-    return bool(row and row[0] == 3)
+    return bool(row and row[0] == 4)
+
+
+def _drop_lane_checks(conn: sqlite3.Connection) -> None:
+    """Rebuild ``status`` and ``link`` when their lane column still carries the old CHECK.
+
+    The rebuild copies every row and recreates the index, so an existing board keeps its project
+    lanes and session links; the check is on the table's own SQL text, which makes a second open a
+    no-op. ``status_source`` keeps its CHECK: sources are still a fixed vocabulary.
+    """
+    def lane_check(table: str) -> bool:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()
+        return bool(row and "CHECK (status IN" in " ".join((row[0] or "").split()))
+
+    if lane_check("status"):
+        conn.execute("DROP TABLE IF EXISTS status__lanes")
+        conn.execute(_STATUS_REBUILD)
+        conn.execute(
+            "INSERT INTO status__lanes (project_id, status, note, source, updated_at) "
+            "SELECT project_id, status, note, source, updated_at FROM status")
+        conn.execute("DROP TABLE status")
+        conn.execute("ALTER TABLE status__lanes RENAME TO status")
+        conn.execute("CREATE INDEX IF NOT EXISTS status_updated_idx ON status (updated_at)")
+    if lane_check("link"):
+        conn.execute("DROP TABLE IF EXISTS link__lanes")
+        conn.execute(_LINK_REBUILD)
+        conn.execute(
+            f"INSERT INTO link__lanes ({_LINK_COLUMNS}) SELECT {_LINK_COLUMNS} FROM link")
+        conn.execute("DROP TABLE link")
+        conn.execute("ALTER TABLE link__lanes RENAME TO link")
+        conn.execute("CREATE INDEX IF NOT EXISTS link_project_idx ON link (project_id)")
+
+
+def _seed_lanes(conn: sqlite3.Connection, *, migrate_system: bool = False) -> None:
+    """Write the system lanes, and finish the one-time system migration on an older board.
+
+    A fresh table gets all seven in order. A board written before ``system`` existed already holds
+    five rows: the missing two are inserted, all seven are marked system (they were the defaults),
+    and the order is rewritten once so unfiled leads and canceled ends, with any custom lane kept
+    behind them in its existing order. That rewrite runs only on the pass that added the column, so
+    a reorder a user made afterwards survives every later open.
+    """
+    now = time.time()
+    existing = {str(row[0]) for row in conn.execute("SELECT id FROM lanes")}
+    if not existing:
+        conn.executemany(
+            "INSERT INTO lanes (id, label, position, custom, system, created_at) "
+            "VALUES (?, ?, ?, 0, 1, ?)",
+            [(lane_id, label, position, now) for position, (lane_id, label) in enumerate(SEED_LANES)])
+        return
+    for lane_id, label in SEED_LANES:
+        if lane_id in existing:
+            continue
+        conn.execute(
+            "INSERT INTO lanes (id, label, position, custom, system, created_at) "
+            "VALUES (?, ?, ?, 0, 1, ?)",
+            (lane_id, label, len(existing), now))
+        existing.add(lane_id)
+    if not migrate_system:
+        return
+    ids = [str(row[0]) for row in conn.execute("SELECT id FROM lanes ORDER BY position, id")]
+    placeholders = ", ".join("?" for _ in SEED_LANE_IDS)
+    conn.execute(
+        f"UPDATE lanes SET system = 1, custom = 0 WHERE id IN ({placeholders})", SEED_LANE_IDS)
+    system_order = [lane_id for lane_id in SEED_LANE_IDS if lane_id in ids]
+    rest = [lane_id for lane_id in ids if lane_id not in system_order]
+    _renumber_lanes(conn, system_order + rest)
 
 
 def _rollback(conn: sqlite3.Connection) -> None:
@@ -249,29 +380,79 @@ def _link_row(row: Sequence[Any]) -> dict[str, Any]:
             "status_updated_at": status_updated_at}
 
 
-def resolve_lane(link: Optional[dict[str, Any]],
-                 status: Optional[dict[str, Any]]) -> dict[str, Any]:
-    """The lane a card shows: an explicit session status wins, otherwise the project's lane.
+def _derived_lane(link: dict[str, Any]) -> str:
+    """The lane a linked work item derives: done when it landed, canceled when it was dropped.
+
+    The store never talks to GitHub, so this reads what a caller put on the link dictionary (a
+    ``pr_state`` row or string, ``pr_merged``, and the issue's ``state``/``state_reason``). An item
+    that is open, missing or unreadable derives nothing: an open PR is not a reason to move a card
+    to review, and only the user's own lane move does that.
+    """
+    pr = link.get("pr_state")
+    merged = link.get("pr_merged")
+    pr_state = ""
+    if isinstance(pr, dict):
+        pr_state = _clean(pr.get("state")).lower()
+        merged = pr.get("merged") if merged is None else merged
+    elif pr is not None:
+        pr_state = _clean(pr).lower()
+    if merged is True or pr_state == "merged":
+        return "done"
+    if pr_state == "closed" or pr_state == "canceled" or pr_state == "cancelled":
+        return "canceled"
+
+    issue_state = _clean(link.get("issue_state")).lower()
+    reason = _clean(link.get("issue_state_reason")).lower()
+    if issue_state == "closed":
+        if reason in ("not_planned", "duplicate"):
+            return "canceled"
+        if reason in ("", "completed"):
+            return "done"
+    return ""
+
+
+def resolve_lane(link: Optional[dict[str, Any]], status: Optional[dict[str, Any]],
+                 lanes: Optional[Sequence[str]] = None) -> dict[str, Any]:
+    """The lane a card shows: an explicit session lane, then the linked item, then the project's.
 
     This is the one rule the server and the Desktop renderer share. The renderer cannot import
-    Python, so it applies the same order to the rows ``GET /board`` hands it: ``link.status`` when
-    it is set, else the ``status`` row for the link's project. No PR state is consulted here; the
-    renderer refines a PR's own state from data it already has.
+    Python, so it applies the same order to the rows ``GET /board`` hands it. Nothing set anywhere
+    answers ``unfiled`` rather than inventing Backlog: a card only reads Backlog when somebody put
+    it there. ``lanes`` is the live lane ids in position order; a stored id that is no longer live
+    degrades to the first lane instead of showing nothing. Without ``lanes`` the seed tuple is the
+    vocabulary, which keeps the pure call sites unchanged.
     """
+    ids = [str(item) for item in lanes] if lanes is not None else list(SEED_LANE_IDS)
+    fallback = ids[0] if ids else ""
     link = link or {}
     status = status or {}
-    lane = _clean(link.get("status")).lower()
-    if lane in STATUSES:
-        return {"status": lane, "scope": "session",
-                "source": _clean(link.get("status_source")).lower() or "user",
-                "note": link.get("note") or "",
-                "updated_at": link.get("status_updated_at")}
-    lane = _clean(status.get("status")).lower()
-    if lane in STATUSES:
-        return {"status": lane, "scope": "project",
-                "source": _clean(status.get("source")).lower() or "user",
-                "note": status.get("note") or "",
-                "updated_at": status.get("updated_at")}
+    link_lane = _clean(link.get("status")).lower()
+    project_lane = _clean(status.get("status")).lower()
+
+    def card(row: dict[str, Any], scope: str, lane: str, source: Optional[str] = None) -> dict[str, Any]:
+        return {"status": lane, "scope": scope,
+                "source": _clean(source if source is not None else
+                                 row.get("status_source" if scope == "session" else "source"))
+                .lower() or "user",
+                "note": row.get("note") or "",
+                "updated_at": row.get("status_updated_at" if scope == "session" else "updated_at")}
+
+    if link_lane:
+        if link_lane in ids:
+            return card(link, "session", link_lane)
+        if fallback:  # a deleted lane raced this read: show the first lane, never a blank card
+            return card(link, "session", fallback)
+    derived = _derived_lane(link)
+    if derived and derived in ids:
+        return card(link, "session", derived, source="auto")
+    if project_lane:
+        if project_lane in ids:
+            return card(status, "project", project_lane)
+        if fallback:
+            return card(status, "project", fallback)
+    if "unfiled" in ids:
+        return {"status": "unfiled", "scope": "", "source": "unset",
+                "note": "", "updated_at": None}
     return {"status": "", "scope": "", "source": "", "note": "", "updated_at": None}
 
 
@@ -485,9 +666,10 @@ def session_card(session_id: Optional[str]) -> dict[str, Any]:
             project_row = conn.execute(
                 "SELECT project_id, label, paths, updated_at FROM project WHERE project_id = ?",
                 (pid,)).fetchone()
+        lane_ids = _lane_ids_on(conn)
     state = _status_row(status_row) if status_row else None
     return _ok(session_id=key, link=link, status=state,
-               lane=resolve_lane(link, state),
+               lane=resolve_lane(link, state, lane_ids),
                project=_project_row(project_row) if project_row else None)
 
 
@@ -507,9 +689,10 @@ def card_for_project(project_id: Optional[str], session_id: Optional[str] = None
         project_row = conn.execute(
             "SELECT project_id, label, paths, updated_at FROM project WHERE project_id = ?",
             (pid,)).fetchone()
+        lane_ids = _lane_ids_on(conn)
     state = _status_row(status_row) if status_row else None
     return _ok(session_id=session_id or "", link=None, status=state,
-               lane=resolve_lane(None, state),
+               lane=resolve_lane(None, state, lane_ids),
                project=_project_row(project_row) if project_row else None)
 
 
@@ -525,6 +708,183 @@ def project_exists(project_id: Optional[str]) -> bool:
         return False
     with _session() as conn:
         return _project_exists(conn, pid)
+
+
+# --- Lanes -------------------------------------------------------------------
+
+def _lane_ids_on(conn: sqlite3.Connection) -> list[str]:
+    return [str(row[0]) for row in conn.execute("SELECT id FROM lanes ORDER BY position, id")]
+
+
+def _lane_rows_on(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    return [{"id": row[0], "label": row[1], "order": int(row[2]), "custom": int(row[3]),
+             "system": int(row[4])}
+            for row in conn.execute(
+                "SELECT id, label, position, custom, system FROM lanes ORDER BY position, id")]
+
+
+def _lane_known_on(conn: sqlite3.Connection, lane: str) -> bool:
+    return conn.execute("SELECT 1 FROM lanes WHERE id = ?", (lane,)).fetchone() is not None
+
+
+def _lane_gone(state: str) -> dict[str, Any]:
+    """The lane a caller validated was deleted before this write transaction began.
+
+    ``set_status`` checks the lane in its own read and then opens ``BEGIN IMMEDIATE``
+    for the write, so a concurrent ``delete_lane`` can land in between. Re-checking
+    inside the transaction is what stops a row being stored with an id the board no
+    longer has while the answer still says ``ok``.
+    """
+    return _fail("bad_status", "That lane was just removed; pick another lane.", status=state)
+
+
+def _renumber_lanes(conn: sqlite3.Connection, ids: Sequence[str]) -> None:
+    conn.executemany("UPDATE lanes SET position = ? WHERE id = ?",
+                     [(position, lane) for position, lane in enumerate(ids)])
+
+
+def _slug(text: str) -> str:
+    """A lane id from a label: lowercase, runs of anything else to ``-``, 24 characters at most."""
+    slug = re.sub(r"[^a-z0-9]+", "-", _clean(text).lower()).strip("-")
+    return slug[:24].strip("-")
+
+
+def _lane_refusal(state: Any) -> tuple[str, Optional[dict[str, Any]]]:
+    """``(normalised id, refusal)``: lowercase and trim, shape check, then a lookup in ``lanes``.
+
+    An unknown id is still ``code: bad_status`` and the message names the live ids, so a tool or a
+    hook that was written against the seeded ids keeps working and a typo reads usefully.
+    """
+    lane = _clean(state).lower()
+    with _session() as conn:
+        ids = _lane_ids_on(conn)
+        if _LANE_ID.match(lane) and _lane_known_on(conn, lane):
+            return lane, None
+    return lane, _fail("bad_status", f"status must be one of {', '.join(ids)}", status=state)
+
+
+def lane_ids() -> list[str]:
+    """The live lane ids, first lane first."""
+    with _session() as conn:
+        return _lane_ids_on(conn)
+
+
+def lanes() -> list[dict[str, Any]]:
+    """Every lane definition, sorted by position."""
+    with _session() as conn:
+        return _lane_rows_on(conn)
+
+
+def save_lane(lane_id: Optional[str] = None, label: Optional[str] = None,
+              order: Any = None) -> dict[str, Any]:
+    """Create a lane (no ``id``) or rename and/or move one (``id`` given).
+
+    Without an id, the id is a slug of the label. A duplicate slug is ``code: lane_exists`` and a
+    label that slugs to nothing (or to something that is not a valid id) is ``code: bad_label``.
+    The new lane is custom and appended, unless ``order`` names a position. With an id, an unknown
+    lane is ``code: unknown_lane``; ``label`` renames and ``order`` moves, both optional.
+    """
+    lane = _clean(lane_id).lower()
+    text = _clean(label)
+    position: Optional[int] = None
+    if order is not None and order != "":
+        try:
+            position = int(order)
+        except (TypeError, ValueError):
+            return _fail("bad_order", "order must be a non-negative integer", order=order)
+        if position < 0:
+            return _fail("bad_order", "order must be a non-negative integer", order=order)
+    with _session() as conn:
+        with _write(conn):
+            ids = _lane_ids_on(conn)
+            if lane:
+                if lane not in ids:
+                    return _fail("unknown_lane", f"{lane!r} is not a live lane", lane=lane)
+                if text:
+                    conn.execute("UPDATE lanes SET label = ? WHERE id = ?", (text, lane))
+                if position is not None:
+                    ids.remove(lane)
+                    ids.insert(min(position, len(ids)), lane)
+                    _renumber_lanes(conn, ids)
+                return _ok(lane=lane, lanes=_lane_rows_on(conn))
+            slug = _slug(text)
+            if not text or not slug or not _LANE_ID.match(slug):
+                return _fail("bad_label",
+                             "label must start with a letter and hold only letters, digits and dashes",
+                             label=label)
+            if slug in ids:
+                return _fail("lane_exists", f"lane {slug!r} already exists", lane=slug)
+            at = len(ids) if position is None else min(position, len(ids))
+            conn.execute(
+                "INSERT INTO lanes (id, label, position, custom, system, created_at) "
+                "VALUES (?, ?, ?, 1, 0, ?)",
+                (slug, text, at, time.time()))
+            ids.insert(at, slug)
+            _renumber_lanes(conn, ids)
+            return _ok(lane=slug, lanes=_lane_rows_on(conn))
+
+
+def reorder_lanes(ids: Any) -> dict[str, Any]:
+    """Write ``0..n-1`` positions for exactly the live lane ids, in the order given."""
+    if not isinstance(ids, (list, tuple)):
+        return _fail("bad_order", "ids must be a list of lane ids")
+    wanted = [_clean(item).lower() for item in ids]
+    with _session() as conn:
+        with _write(conn):
+            current = _lane_ids_on(conn)
+            if (len(wanted) != len(current) or len(set(wanted)) != len(wanted)
+                    or set(wanted) != set(current)):
+                return _fail("bad_order", f"ids must be a permutation of {', '.join(current)}")
+            _renumber_lanes(conn, wanted)
+            return _ok(lanes=_lane_rows_on(conn))
+
+
+def delete_lane(lane_id: Optional[str], reassign: Optional[str] = None) -> dict[str, Any]:
+    """Delete a custom lane. A system lane, the last lane, or a lane rows still name is refused.
+
+    The seven seeded lanes are the board's vocabulary and every hook, tool and derived lane speaks
+    their ids: they may be renamed and reordered, never removed, so the answer is ``system_lane``
+    and nothing is written. A custom lane a user added deletes normally. When rows hold the id and
+    no reassign is given the answer is ``code: lane_in_use`` with the counts. With a live reassign
+    id the project status rows and session links move inside the same transaction as the delete, so
+    no stored row is ever left naming a lane that is gone.
+    """
+    lane = _clean(lane_id).lower()
+    target = _clean(reassign).lower()
+    with _session() as conn:
+        with _write(conn):
+            ids = _lane_ids_on(conn)
+            if lane not in ids:
+                return _fail("unknown_lane", f"{lane!r} is not a live lane", lane=lane)
+            row = conn.execute("SELECT system, custom FROM lanes WHERE id = ?", (lane,)).fetchone()
+            if row is not None and (int(row[0]) or not int(row[1])):
+                return _fail("system_lane",
+                             f"lane {lane!r} is a system lane; rename or reorder it instead",
+                             lane=lane)
+            if len(ids) <= 1:
+                return _fail("last_lane", "the board must keep at least one lane", lane=lane)
+            project_count = conn.execute(
+                "SELECT count(*) FROM status WHERE status = ?", (lane,)).fetchone()[0]
+            link_count = conn.execute(
+                "SELECT count(*) FROM link WHERE status = ?", (lane,)).fetchone()[0]
+            if target and (target not in ids or target == lane):
+                return _fail("unknown_lane", f"{target!r} is not another live lane", lane=target)
+            if (project_count or link_count) and not target:
+                return _fail("lane_in_use",
+                             f"lane {lane!r} is in use; pass reassign with another live lane",
+                             lane=lane, project_status=project_count, links=link_count)
+            now = time.time()
+            if project_count or link_count:
+                conn.execute("UPDATE status SET status = ?, updated_at = ? WHERE status = ?",
+                             (target, now, lane))
+                conn.execute(
+                    "UPDATE link SET status = ?, status_updated_at = ?, updated_at = ? "
+                    "WHERE status = ?", (target, now, now, lane))
+            conn.execute("DELETE FROM lanes WHERE id = ?", (lane,))
+            _renumber_lanes(conn, [item for item in ids if item != lane])
+            return _ok(lane=lane, reassign=target or None,
+                       project_status=project_count, links=link_count,
+                       lanes=_lane_rows_on(conn))
 
 
 # --- Writes ------------------------------------------------------------------
@@ -549,9 +909,9 @@ def set_status(project_id: Optional[str], status: Optional[str], note: Optional[
     the routes answer ``unknown_project`` instead of growing a ghost project.
     """
     pid = _clean(project_id)
-    state = _clean(status).lower()
-    if state not in STATUSES:
-        return _fail("bad_status", f"status must be one of {', '.join(STATUSES)}", status=status)
+    state, refusal = _lane_refusal(status)
+    if refusal:
+        return refusal
     src = _clean(source).lower() or "user"
     if src not in SOURCES:
         return _fail("bad_source", f"source must be one of {', '.join(SOURCES)}")
@@ -568,6 +928,8 @@ def set_status(project_id: Optional[str], status: Optional[str], note: Optional[
     now = time.time()
     with _session() as conn:
         with _write(conn):
+            if not _lane_known_on(conn, state):
+                return _lane_gone(state)
             if not _project_exists(conn, pid):
                 if not (auto_project and _project_table_empty(conn)):
                     return _fail("unknown_project", f"{pid!r} is not a synced project", project_id=pid)
@@ -590,6 +952,8 @@ def _set_session_status(pid: str, sid: str, state: str, note: Optional[str], src
     now = time.time()
     with _session() as conn:
         with _write(conn):
+            if not _lane_known_on(conn, state):
+                return _lane_gone(state)
             key, row = _resolve_link_on(conn, sid)
             if row is None:
                 if not pid:
@@ -628,11 +992,11 @@ def move_status_if_current(project_id: Optional[str], expect: Optional[str], new
     """
     pid = _clean(project_id)
     want = _clean(expect).lower()
-    state = _clean(new).lower()
     if not pid:
         return _fail("empty_project", "project_id is required")
-    if state not in STATUSES:
-        return _fail("bad_status", f"status must be one of {', '.join(STATUSES)}", status=new)
+    state, refusal = _lane_refusal(new)
+    if refusal:
+        return refusal
     src = _clean(source).lower() or "auto"
     if src not in SOURCES:
         return _fail("bad_source", f"source must be one of {', '.join(SOURCES)}")
@@ -669,9 +1033,9 @@ def move_session_status_if_current(session_id: Optional[str], expect: Any, new: 
     sid = _clean(session_id)
     if not sid:
         return _fail("empty_session", "session_id is required")
-    state = _clean(new).lower()
-    if state not in STATUSES:
-        return _fail("bad_status", f"status must be one of {', '.join(STATUSES)}", status=new)
+    state, refusal = _lane_refusal(new)
+    if refusal:
+        return refusal
     src = _clean(source).lower() or "auto"
     if src not in SOURCES:
         return _fail("bad_source", f"source must be one of {', '.join(SOURCES)}")
@@ -735,6 +1099,8 @@ def seed(statuses: Any) -> dict[str, Any]:
     now = time.time()
     rows: list[tuple[str, str, Optional[str], str]] = []
     skipped = 0
+    with _session() as conn:
+        live = set(_lane_ids_on(conn))
     for item in statuses:
         if not isinstance(item, dict):
             skipped += 1
@@ -742,7 +1108,7 @@ def seed(statuses: Any) -> dict[str, Any]:
         pid = _clean(item.get("project_id") or item.get("id"))
         state = _clean(item.get("status")).lower()
         src = _clean(item.get("source")).lower() or "user"
-        if not pid or state not in STATUSES:
+        if not pid or not _LANE_ID.match(state) or state not in live:
             skipped += 1
             continue
         rows.append((pid, state, _clean(item.get("note")) or None, src if src in SOURCES else "user"))

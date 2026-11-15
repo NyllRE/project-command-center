@@ -207,13 +207,11 @@ def main() -> int:
 
     raw = sqlite3.connect(live)
     try:
-        try:
-            raw.execute("UPDATE link SET status = 'nope' WHERE session_id = 's-old'")
-            raw.commit()
-            refused = False
-        except sqlite3.IntegrityError:
-            refused = True
-        check("the CHECK constraint refuses an unknown lane", refused)
+        schema_sql = " ".join(
+            (raw.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'link'")
+             .fetchone() or [""])[0].split())
+        check("the lane column is no longer a CHECK: lanes are data now",
+              "CHECK (status IN" not in schema_sql, schema_sql[:120])
         try:
             raw.execute("UPDATE link SET status_source = 'nope' WHERE session_id = 's-old'")
             raw.commit()
@@ -291,8 +289,9 @@ def main() -> int:
           fallback["status"] == "active" and fallback["scope"] == "project"
           and fallback["note"] == "project note")
     empty = store.resolve_lane({}, {})
-    check("neither set answers an empty lane",
-          empty == {"status": "", "scope": "", "source": "", "note": "", "updated_at": None},
+    check("neither set answers Unfiled, never Backlog",
+          empty == {"status": "unfiled", "scope": "", "source": "unset", "note": "",
+                    "updated_at": None},
           str(empty))
     card = store.session_card("s-old")
     check("session_card carries the resolved lane", card.get("lane", {}).get("status") == "blocked",
@@ -349,6 +348,53 @@ def main() -> int:
     check("pcc_board names the session lane on the project card",
           (board_reply.get("project") or {}).get("link", {}).get("status") == "active",
           str((board_reply.get("project") or {}).get("link")))
+
+    # --- store: a lane deleted between the check and the write --------------
+    # `set_status` validates the lane in a read of its own and only then opens the
+    # write transaction, so a concurrent `delete_lane` can land in between. The
+    # second look inside the transaction is what refuses the dead lane instead of
+    # storing it and answering ok.
+    section("store / a lane deleted between the check and the write is refused")
+    store.set_link("s-race", "pcc")
+    project_lane = store.save_lane(label="QA check").get("lane")
+    session_lane = store.save_lane(label="QA check two").get("lane")
+    check("both race lanes exist", bool(project_lane) and bool(session_lane),
+          f"{project_lane!r} {session_lane!r}")
+    plain_refusal = store._lane_refusal
+
+    def racing_refusal(state):
+        lane_id, refusal = plain_refusal(state)
+        if refusal is None and lane_id in (project_lane, session_lane):
+            # Another process deletes the lane right after this read returned.
+            store.delete_lane(lane_id)
+        return lane_id, refusal
+
+    store._lane_refusal = racing_refusal
+    try:
+        before_project = (store.get_status("pcc") or {}).get("status")
+        raced_project = store.set_status("pcc", project_lane, "raced", "user")
+        raced_session = store.set_status("pcc", session_lane, "raced", "user", session_id="s-race")
+    finally:
+        store._lane_refusal = plain_refusal
+
+    print(f"  project write: {json.dumps(raced_project, default=str)}")
+    print(f"  session write: {json.dumps(raced_session, default=str)}")
+    for name, reply in (("project", raced_project), ("session", raced_session)):
+        check(f"a {name} write to a lane deleted before the transaction is refused",
+              reply.get("ok") is False and reply.get("code") == "bad_status",
+              str(reply.get("code")))
+        check(f"the {name} refusal says the lane was just removed",
+              reply.get("error") == "That lane was just removed; pick another lane.",
+              str(reply.get("error")))
+    check("the project lane is untouched by the refused write",
+          (store.get_status("pcc") or {}).get("status") == before_project,
+          str((store.get_status("pcc") or {}).get("status")))
+    check("the session row keeps no lane from the refused write",
+          (store.get_link("s-race") or {}).get("status") is None,
+          str(store.get_link("s-race")))
+    check("neither dead lane is back in the table",
+          project_lane not in store.lane_ids() and session_lane not in store.lane_ids(),
+          str(store.lane_ids()))
 
     # --- hooks: pre_llm_call ------------------------------------------------
     section("hook / pre_llm_call names the session's lane")
@@ -507,6 +553,48 @@ def main() -> int:
           (board_body.get("auto_link") or {}).get("lane", {}).get("status") == "review"
           and (board_body.get("auto_link") or {}).get("lane", {}).get("scope") == "session",
           str(board_body.get("auto_link")))
+
+    # The auto_link cwd is the server process's own folder, never the session's,
+    # so the route may not name it `cwd_prefix`.
+    response = client.get("/board", params={"session_id": "s-route-cwd"})
+    cwd_auto = (response.json().get("auto_link") or {})
+    print(f"  GET /board cwd: via={cwd_auto.get('via')} project={cwd_auto.get('project_id')}")
+    check("GET /board never labels the server's cwd as the session's",
+          cwd_auto.get("via") != "cwd_prefix", str(cwd_auto))
+    check("a cwd-resolved project is named server_cwd",
+          cwd_auto.get("project_id") != "pcc" or cwd_auto.get("via") == "server_cwd", str(cwd_auto))
+
+    # The live cwd here is the sandbox's, so no project matches it. Drive the
+    # rule directly with a store that answers from the cwd branch.
+    import agent.runtime_cwd as runtime_cwd
+    original_cwd = runtime_cwd.resolve_agent_cwd
+    runtime_cwd.resolve_agent_cwd = lambda: PLUGIN
+
+    class CwdStore:
+        def resolve_link(self, session_id):
+            return "", None
+
+        def resolve_project(self, session_id=None, explicit=None, use_cwd=True):
+            return "pcc"
+
+        def get_status(self, project_id):
+            return {"status": "active"}
+
+        def resolve_lane(self, link, status, ids):
+            return {"status": (status or {}).get("status", ""), "scope": "project",
+                    "source": "user", "note": "", "updated_at": None}
+
+        def lane_ids(self):
+            return list(store.lane_ids())
+
+    try:
+        cwd_only = api._auto_link(CwdStore(), "s-cwd-only")
+    finally:
+        runtime_cwd.resolve_agent_cwd = original_cwd
+    print(f"  auto_link cwd branch: {cwd_only.get('via')}")
+    check("a cwd match is named server_cwd, and the answer says it is not the session's folder",
+          cwd_only.get("via") == "server_cwd" and cwd_only.get("project_id") == "pcc",
+          str(cwd_only))
 
     print(f"\n{'PASS' if not FAILURES else 'FAIL'}: {len(FAILURES)} failure(s)")
     if FAILURES:

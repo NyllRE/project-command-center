@@ -35,12 +35,13 @@ Git is read only except one route: ``POST /branch/switch`` runs ``git switch``
 on the main checkout after refusing a dirty tree, a linked worktree, a branch
 checked out elsewhere and any in-progress operation. It never stashes, never
 discards and never forces, and every git child is a fixed argv.
-GitHub writes are four routes and nothing else: ``POST /github/issue/{n}/comment`` and
-``POST /github/pr/{n}/comment`` post one comment, and
+GitHub writes are five routes and nothing else: ``POST /github/issue/{n}/comment`` and
+``POST /github/pr/{n}/comment`` post one comment,
 ``POST /github/issue/{n}/state`` / ``POST /github/pr/{n}/state`` set open or
-closed. All four write over the authenticated ``gh`` CLI as that account (never
-the token), with a JSON body on the child's stdin so no comment text is ever
-quoted into a command line.
+closed, and ``POST /github/reaction`` toggles one reaction on a body, an issue
+comment or a review comment. All five write over the authenticated ``gh`` CLI as
+that account (never the token), with a JSON body on the child's stdin so no
+comment text is ever quoted into a command line.
 No shell: every child is ``create_subprocess_exec`` with an argv and a
 timeout; no ``shell=True``, no ``os.system``, no command string. No credential
 files: ``GITHUB_TOKEN`` comes from ``agent.secret_scope.get_secret`` inside the
@@ -61,11 +62,22 @@ quiet line instead of a bare status. Only a malformed path is a 400.
 ``GET /diagnose`` reports folder, git, token presence, gh login and a labelled
 probe per credential, which is how "why is my repo not loading" gets answered
 from inside the gateway.
+``GET /goals?session_ids=<id,id,...>`` answers the ACTIVE ``/goal`` on up to 60
+sessions in one read: one batched read per board poll instead of one
+``session.control.read`` gateway round trip per card. It reads the persisted
+``state_meta`` row through the PUBLISHED plugin API (``hermes_state``, a
+documented whole-module surface in ``hermes_cli/data/plugin_api.json``) with
+``SessionDB(read_only=True)`` — never a private core import (catalog rule 9) and
+never a second writer beside the gateway's registry handle. Only an active goal
+is included, so a session with no goal (or a paused, done or cleared one) is
+absent; an unreadable state database is ``code: goals_unavailable`` with
+HTTP 200, never a 500.
 
 Caching is one in process dict keyed by (owner, repo, endpoint, params) with a
 60 s TTL; with a token the board read revalidates with the stored ETag, and
 ``refresh=1`` bypasses it. Icon results use their own keys: a local image 300 s
-(folder, file path, mtime), a remote image 3600 s, a glyph 300 s.
+(folder, file path, mtime), a remote image 3600 s, a glyph 300 s. Session goals
+are keyed by their sorted id list and live 30 s; no failure is ever cached.
 """
 
 from __future__ import annotations
@@ -97,7 +109,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 PLUGIN_NAME = "project-command-center"
-PLUGIN_VERSION = "0.4.2"
+PLUGIN_VERSION = "0.5.0"
 GIT_TIMEOUT = 5.0
 # A checkout is the one git call that can legitimately take minutes: a large tree,
 # an LFS smudge, a slow disk. Killing it mid-run leaves a half-moved work tree and
@@ -110,6 +122,11 @@ GH_TIMEOUT = 15.0  # the GraphQL PR pass is the slow gh call; everything else is
 HTTP_TIMEOUT = 10.0
 REPO_TTL = 20.0
 GITHUB_TTL = 60.0
+# A session's /goal is a read-only `state_meta` lookup on the state database, so the batch is cheap
+# but not free: 60 sessions cost 60 meta reads. 30 s matches how often a goal can visibly change
+# (one turn), and the board poll is 15 s.
+GOALS_TTL = 30.0
+MAX_GOAL_SESSIONS = 60
 MAX_CACHED_ENTRIES = 256
 MAX_CONCURRENT_GITHUB_CALLS = 2
 # GitHub resolves one aliased pullRequest(number:) in roughly 0.6 s on a busy
@@ -119,6 +136,11 @@ MAX_CONCURRENT_GITHUB_CALLS = 2
 MAX_PRS_ENRICHED = 10
 MAX_BRANCHES = 40
 MAX_COMMENTS = 100
+# Reactions are one REST read per object (GitHub has no batch endpoint for them),
+# so a thread with a hundred comments would pay a hundred round trips. The body
+# and the first MAX_REACTION_OBJECTS comments carry reactions; every other
+# comment still carries the key, as an empty list, so the modal's shape holds.
+MAX_REACTION_OBJECTS = 30
 MAX_REFS = 50
 MAX_COUNT_PATHS = 50
 API = "https://api.github.com"
@@ -219,6 +241,15 @@ class CommentRow(TypedDict):
     created_at: Optional[str]
     updated_at: Optional[str]
     url: Optional[str]
+    reactions: NotRequired[list[dict[str, Any]]]
+
+
+class ReactionRow(TypedDict):
+    """One reaction content on one object: how many, and whether this account is in it."""
+
+    content: str
+    count: int
+    mine: bool
 
 
 class ReviewRow(TypedDict):
@@ -387,6 +418,13 @@ FAILURE_CODES = frozenset({"folder_missing", "not_a_repo", "no_remote", "repo_no
 # one of these, and an unknown code is upstream_error rather than a class name.
 WRITE_CODES = frozenset({"empty_comment", "bad_state", "not_found", "forbidden",
                          "rate_limited", "upstream_error"})
+
+# GitHub's eight reaction contents, in its own canonical order. The write route
+# takes exactly these strings, not the emoji and not the GraphQL enum names.
+REACTION_CONTENTS = ("+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes")
+REACTION_KINDS = frozenset({"issue", "pr", "issue_comment", "review_comment"})
+# A reaction refusal names its reason with one of these, never a status line.
+REACTION_CODES = frozenset({"bad_kind", "bad_content", "gh_unavailable", "gh_error"})
 
 
 class _FolderMissing(Exception):
@@ -1856,6 +1894,96 @@ def _review_rows(rows: Any) -> list[ReviewRow]:
     return out
 
 
+# --- Reactions --------------------------------------------------------------
+#
+# GitHub keeps reactions per object and has no batch read for them: the issue or
+# PR body, each issue comment and each review comment answers on its own URL.
+# Rows are aggregated here into the modal's shape — one entry per content, in
+# GitHub's canonical order — and a failed read degrades that object to an empty
+# list instead of failing the whole detail.
+
+
+def _reaction_count(rows: Any, me: Optional[str]) -> list[dict[str, Any]]:
+    """Raw reaction rows -> ``[{content, count, mine}]``, order fixed, empties dropped.
+
+    ``mine`` is true only when the authenticated login is in that content's own
+    ``users`` list: another account's reaction of the same content never counts.
+    """
+    tally: dict[str, dict[str, Any]] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        content = str(row.get("content") or "")
+        if content not in REACTION_CONTENTS:
+            continue
+        entry = tally.setdefault(content, {"content": content, "count": 0, "mine": False})
+        entry["count"] += 1
+        user = row.get("user")
+        login = user.get("login") if isinstance(user, dict) else ""
+        if me and str(login or "") == me:
+            entry["mine"] = True
+    return [tally[content] for content in REACTION_CONTENTS if content in tally]
+
+
+def _reaction_toggled(reactions: Sequence[dict[str, Any]], content: str,
+                      *, removed: bool) -> list[dict[str, Any]]:
+    """The list after one toggle, for when the confirming re-read fails.
+
+    It is only ever a fallback: the route prefers the fresh read, and this keeps
+    the chip row on screen with the change the user just made instead of blanking.
+    """
+    tally = {str(row.get("content")): dict(row) for row in reactions
+             if isinstance(row, dict) and row.get("content") in REACTION_CONTENTS}
+    entry = tally.get(content)
+    if entry is None:
+        entry = {"content": content, "count": 1, "mine": True}
+        if removed:
+            entry = {"content": content, "count": 0, "mine": False}
+        tally[content] = entry
+    elif removed:
+        entry["count"] = max(0, _int(entry.get("count")) - 1)
+        entry["mine"] = False
+    else:
+        entry["count"] = _int(entry.get("count")) + 1
+        entry["mine"] = True
+    return [tally[c] for c in REACTION_CONTENTS if c in tally and _int(tally[c].get("count")) > 0]
+
+
+async def _reactions(gh: "_GhReader", path: str, me: Optional[str]) -> list[dict[str, Any]]:
+    """One object's reactions; a failed read is ``[]``, never an exception."""
+    try:
+        response = await gh.rest(path, {"per_page": 100})
+    except _UpstreamError as exc:
+        log.info("project-command-center: reactions unavailable at %s: %s", path, exc)
+        return []
+    return _reaction_count(_as_list(response), me)
+
+
+def _comment_reaction_path(owner: str, name: str, comment_id: int) -> str:
+    return f"/repos/{owner}/{name}/issues/comments/{comment_id}/reactions"
+
+
+async def _attach_reactions(gh: "_GhReader", comments: Sequence[CommentRow],
+                            me: Optional[str], owner: str, name: str) -> list[CommentRow]:
+    """Fill ``reactions`` on every comment, reading at most MAX_REACTION_OBJECTS.
+
+    The reads are one gather, so a thread costs its comments' reactions at the
+    GitHub client's two-in-flight bound rather than one round trip after another.
+    """
+    targets = comments[:MAX_REACTION_OBJECTS]
+    wanted = [c for c in targets if _int(c.get("id")) > 0]
+    if wanted:
+        found = await asyncio.gather(*(
+            _reactions(gh, _comment_reaction_path(owner, name, _int(c.get("id"))), me)
+            for c in wanted))
+        by_id = {_int(c.get("id")): reactions for c, reactions in zip(wanted, found)}
+    else:
+        by_id = {}
+    for comment in comments:
+        comment["reactions"] = by_id.get(_int(comment.get("id")), [])
+    return list(comments)
+
+
 def _counts(issues: Sequence[IssueRow], pulls: Sequence[PullRow]) -> Counts:
     """Board aggregates. ``review_ready`` is: open, not a draft, no failing checks and no
     requested changes, so the number matches the rows a reviewer can act on today. The four
@@ -2045,20 +2173,25 @@ def _cache_drop(owner: str, name: str) -> None:
         _CACHE.pop(key, None)
 
 
-async def _gh_write(method: str, path: str, body: Mapping[str, Any], *, subject: str,
+async def _gh_write(method: str, path: str, body: Optional[Mapping[str, Any]], *, subject: str,
                     action: str, owner: str, repo: str, number: int) -> Any:
     """One ``gh api`` write with the JSON body on the child's stdin.
 
     The argv is fixed — ``gh api -i --method <M> --input - <endpoint>`` — so the
     body never appears in an argument and there is no shell: a comment holding
-    quotes, backticks, ``$(`` or newlines arrives byte for byte. Statuses become
-    codes: 404 ``not_found``, 401/403 ``forbidden`` (a spent 403 or 429 is
+    quotes, backticks, ``$(`` or newlines arrives byte for byte. ``body=None``
+    (a DELETE with nothing to say) drops ``--input -`` instead of sending ``{}``.
+    Statuses become codes: 404 ``not_found``, 401/403 ``forbidden`` (a spent 403 or 429 is
     ``rate_limited``), anything else ``upstream_error``.
     """
-    argv = ["gh", "api", "-i", "--method", method.upper(), "--input", "-", path]
+    argv = ["gh", "api", "-i", "--method", method.upper()]
+    stdin: Optional[str] = None
+    if body is not None:
+        argv += ["--input", "-"]
+        stdin = json.dumps(dict(body), ensure_ascii=False)
+    argv.append(path)
     try:
-        code, out, err = await _run(argv, timeout=GH_TIMEOUT,
-                                    stdin_data=json.dumps(dict(body), ensure_ascii=False))
+        code, out, err = await _run(argv, timeout=GH_TIMEOUT, stdin_data=stdin)
     except TimeoutError as exc:
         raise _WriteFailure(
             "upstream_error",
@@ -2218,6 +2351,116 @@ async def _set_state(number: int, path: str, payload: Mapping[str, Any],
     _cache_drop(owner, name)
     written = data.get("state") if isinstance(data, dict) else None
     return {"ok": True, "state": str(written or state).lower()}
+
+
+# --- Reactions --------------------------------------------------------------
+#
+# One route toggles a reaction on any of GitHub's four reacting objects. Reads
+# run as the same gh account the write will use, so `mine` and the toggle agree
+# about whose reaction they are looking at. Nothing raises: a refusal is HTTP 200
+# with a code from REACTION_CODES.
+
+
+def _reaction_refusal(code: str, error: str, detail: Optional[str] = None) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": error, "detail": detail, "reactions": []}
+
+
+def _reaction_url(owner: str, name: str, kind: str, number: int, comment_id: int) -> str:
+    """The reactions collection for one object, per GitHub's REST layout."""
+    if kind in ("issue", "pr"):
+        # A pull request's body is an issue body to the reactions API.
+        return f"/repos/{owner}/{name}/issues/{number}/reactions"
+    if kind == "issue_comment":
+        return f"/repos/{owner}/{name}/issues/comments/{comment_id}/reactions"
+    return f"/repos/{owner}/{name}/pulls/comments/{comment_id}/reactions"
+
+
+async def _set_reaction(payload: Mapping[str, Any], folder: str) -> dict[str, Any]:
+    """Add one reaction as the gh account, or remove it when that account already has it."""
+    kind = str(payload.get("kind") or "").strip().lower()
+    content = str(payload.get("content") or "").strip()
+    number = _int(payload.get("number"))
+    comment_id = _int(payload.get("comment_id"))
+
+    if kind not in REACTION_KINDS:
+        return _reaction_refusal(
+            "bad_kind", f'kind must be one of {", ".join(sorted(REACTION_KINDS))}, '
+                        f'not {kind or "nothing"}.')
+    if content not in REACTION_CONTENTS:
+        return _reaction_refusal(
+            "bad_content", f'content must be one of {", ".join(REACTION_CONTENTS)}, '
+                           f'not {content or "nothing"}.')
+    if kind in ("issue", "pr") and number <= 0:
+        return _reaction_refusal(
+            "bad_kind", f"A reaction on {'a pull request' if kind == 'pr' else 'an issue'} "
+                        "needs its number.")
+    if kind in ("issue_comment", "review_comment") and comment_id <= 0:
+        return _reaction_refusal(
+            "bad_kind", "A reaction on a "
+                        f"{'review comment' if kind == 'review_comment' else 'issue comment'} "
+                        "needs its comment_id.")
+    if not str(folder or "").strip():
+        # The write routes carry the folder in the query string; this one may
+        # also carry it in the body, so an empty one is a caller mistake, not a
+        # repository that cannot be reached.
+        return _reaction_refusal("bad_kind", "A reaction needs the project folder to find its repository.")
+
+    repo = await _write_repo(folder)
+    if isinstance(repo, dict):
+        # A folder with no GitHub remote is "GitHub is unavailable here", which
+        # is the one stable code this route offers for it.
+        return _reaction_refusal("gh_unavailable",
+                                 repo.get("error") or "The project folder has no GitHub repository.",
+                                 repo.get("detail"))
+    owner, name = repo
+    me = await _gh_user()
+    if me is None:
+        return _reaction_refusal(
+            "gh_unavailable",
+            "GitHub reactions run as the gh CLI's account and gh is not signed in. "
+            "Run gh auth login, then retry.")
+
+    url = _reaction_url(owner, name, kind, number, comment_id)
+    subject = {"issue": "issue", "pr": "pull request", "issue_comment": "comment",
+               "review_comment": "review comment"}[kind]
+    anchor = number if number > 0 else comment_id
+    client = _GitHub(owner, name, "gh", None)
+    try:
+        before = _as_list(await client.rest(url, {"per_page": 100}))
+    except _UpstreamError as exc:
+        return _reaction_refusal(
+            "gh_error", f"GitHub could not read the reactions on this {subject}.",
+            exc.detail or f"GET {url} -> {exc.code}")
+    existing = next((row for row in before if isinstance(row, dict)
+                     and str(row.get("content") or "") == content
+                     and isinstance(row.get("user"), dict)
+                     and str(row["user"].get("login") or "") == me
+                     and _int(row.get("id")) > 0), None)
+    try:
+        if existing is not None:
+            await _gh_write("DELETE", f"{url}/{_int(existing.get('id'))}", None,
+                            subject=subject, action="remove a reaction from",
+                            owner=owner, repo=name, number=anchor)
+        else:
+            await _gh_write("POST", url, {"content": content}, subject=subject,
+                            action="react to", owner=owner, repo=name, number=anchor)
+    except _WriteFailure as exc:
+        log.info("project-command-center: reaction write failed: %s", exc.error)
+        return _reaction_refusal("gh_error", exc.error, exc.detail)
+
+    _cache_drop(owner, name)
+    try:
+        after = _as_list(await client.rest(url, {"per_page": 100}))
+    except _UpstreamError as exc:
+        log.info("project-command-center: reaction re-read failed: %s", exc)
+        # The write landed; the row keeps the user's click rather than going
+        # blank because the confirming read was the one call that failed.
+        return {"ok": True, "toggled": "removed" if existing is not None else "added",
+                "reactions": _reaction_toggled(_reaction_count(before, me), content,
+                                               removed=existing is not None),
+                "stale": True}
+    return {"ok": True, "toggled": "removed" if existing is not None else "added",
+            "reactions": _reaction_count(after, me)}
 
 
 # --- Icons -------------------------------------------------------------------
@@ -3518,6 +3761,13 @@ async def github_pr(number: int, path: str = Query(..., description="Absolute pa
     comments = _comment_rows(_as_list(comments_response))
     timeline_issues = _timeline_refs(_as_list(timeline_response))[1]
 
+    # The reactions are read as the credential that answered above, and `mine`
+    # is that account's own reaction: a failed read is [] for that object only.
+    me = await _account_name(gh, token)
+    body_reactions = await _reactions(
+        gh, f"/repos/{owner}/{name}/issues/{number}/reactions", me)
+    comments = await _attach_reactions(gh, comments, me, owner, name)
+
     node = (await _enrich_pulls(gh, [number])).get(number)
     row = _pull_row(raw, node)
     linked = sorted(set(row["linked_issues"]) | set(timeline_issues))
@@ -3532,6 +3782,7 @@ async def github_pr(number: int, path: str = Query(..., description="Absolute pa
         "files_changed": files,
         "reviews": reviews,
         "comments": comments,
+        "reactions": body_reactions,
         # None, not {"state": "none"}, when the GraphQL pass could not answer:
         # the modal shows a checks row only for a real rollup.
         "checks": row["checks"] if node is not None else None,
@@ -3576,6 +3827,10 @@ async def github_issue(number: int, path: str = Query(..., description="Absolute
     )
     timeline_pulls = _timeline_refs(_as_list(timeline_response))[0]
     comments = _comment_rows(_as_list(comments_response))
+    me = await _account_name(gh, token)
+    body_reactions = await _reactions(
+        gh, f"/repos/{owner}/{name}/issues/{number}/reactions", me)
+    comments = await _attach_reactions(gh, comments, me, owner, name)
     account = await _account_name(gh, token) if gh.auth_note else None
     payload = {
         "ok": True, "code": "ok", "error": None, "detail": None,
@@ -3590,6 +3845,7 @@ async def github_issue(number: int, path: str = Query(..., description="Absolute
         "assignees": _names(raw.get("assignees"), "login"),
         **({"assignee_avatars": avatars} if (avatars := _assignee_avatars(raw.get("assignees"))) else {}),
         "comments": comments,
+        "reactions": body_reactions,
         "comments_count": _int(raw.get("comments")),
         "created_at": raw.get("created_at"),
         "updated_at": raw.get("updated_at"),
@@ -3872,6 +4128,26 @@ async def github_pr_state(number: int, path: str = Query(...),
     return await _set_state(number, path, payload, "pr")
 
 
+@router.post("/github/reaction")
+async def github_reaction(path: Optional[str] = Query(None),
+                          payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Toggle one reaction on an issue, PR, issue comment or review comment.
+
+    Body: ``{kind, number?, comment_id?, path?, content}`` where ``kind`` is
+    ``issue``, ``pr``, ``issue_comment`` or ``review_comment`` and ``content`` is
+    one of ``+1``, ``-1``, ``laugh``, ``hooray``, ``confused``, ``heart``,
+    ``rocket``, ``eyes``. The folder may ride in the query string (like every
+    other write) or in the body. When the gh account already reacted with that
+    content the same call removes it, so one click toggles; the answer is
+    ``{ok, reactions, toggled}`` for the affected object, ready to repaint the
+    chip row without a reload. Refusals stay HTTP 200 with a code from
+    ``REACTION_CODES``: ``bad_kind``, ``bad_content``, ``gh_unavailable``,
+    ``gh_error``.
+    """
+    folder = path if isinstance(path, str) and path.strip() else str(payload.get("path") or "")
+    return await _set_reaction(payload, folder)
+
+
 # --- Diagnose ---------------------------------------------------------------
 
 def _length_bucket(value: Optional[str]) -> str:
@@ -4037,6 +4313,259 @@ async def icon(path: str = Query(..., description="Absolute path to the project 
     return result
 
 
+# --- Session goals -----------------------------------------------------------
+#
+# A `/goal` lives per session in Hermes' own state.db: one `state_meta` row per session, keyed
+# `goal:<session id>`, whose value is the goal state as JSON (`hermes_cli.goals` writes it, and
+# `GoalState.from_json` is the only reader that interprets it). This route reads that row through
+# the PUBLISHED plugin API instead of importing core internals: `hermes_state` is a documented
+# whole-module surface (`hermes_cli/data/plugin_api.json`, rendered in
+# `developer-guide/plugins/public-api.md`), and `SessionDB(read_only=True)` opens a `mode=ro` pool,
+# so it can never become a second writer beside the gateway's registry handle — the duplicate-writer
+# shape `hermes_cli.goals` itself warns about. Catalog rule 9 ("public surfaces only") is why this
+# is not `from hermes_cli.goals import load_goal`.
+#
+# Why not `session.control.read`, the other public read of this same state? It resolves a LIVE
+# session (`tui_gateway/session_registry.py::_sess_nowait` looks the id up in the in-memory table)
+# and the gateway keys that table by a minted runtime id (`uuid4().hex[:8]`, see
+# `methods_session.py::_new_runtime_ids`), while a board card carries the STORED id from
+# `session.list`. The gateway docs are explicit that these polls never restore a cold session
+# ("use `session.resume` first"), so the renderer would get `4001` for every card — the goal line
+# would vanish from the board. One batched persisted read is both public and correct here.
+#
+# The row's shape is not trusted: it is parsed and type-checked here, and a row that is not a JSON
+# object (or has no string `status`) reads as no goal for that session, exactly as an unparseable
+# row did when `load_goal` parsed it. One unreadable session is skipped, never an error for the rest.
+
+_GOAL_ACTIVE = "active"
+# `hermes_cli.goals._meta_key`: the state_meta key holding one session's goal JSON.
+_GOAL_META_PREFIX = "goal:"
+# `GoalState.max_turns`' default (hermes_cli.goals.DEFAULT_MAX_TURNS), for rows that predate the field.
+_GOAL_DEFAULT_MAX_TURNS = 20
+# A stored session id is `20261113_212605_66fa65`: letters, digits, `_`, `-`, `.` and `:`. Anything
+# else (a path, a URL, whitespace) is not an id this route will look up.
+_SESSION_ID_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _goal_ids(raw: Optional[str]) -> list[str]:
+    """The well formed session ids from a comma list, de-duplicated and capped in order."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for part in str(raw or "").split(","):
+        value = part.strip()
+        if not value or value in seen:
+            continue
+        if not _SESSION_ID_SHAPE.match(value) or ".." in value:
+            continue
+        seen.add(value)
+        ids.append(value)
+        if len(ids) >= MAX_GOAL_SESSIONS:
+            break
+    return ids
+
+
+def _goal_db() -> Any:
+    """A read-only handle on this home's state.db, through the published ``hermes_state`` module.
+
+    One handle per request, closed in the route's ``finally``: a read-only open costs about 4 ms and
+    a request only builds one on a cache miss, while a long-lived handle would pin a read connection
+    (and its permit) for the life of the process. ``read_only=True`` skips the writer open entirely —
+    no mkdir, no token writer thread, no close-time checkpoint.
+    """
+    from hermes_state import SessionDB
+
+    return SessionDB(read_only=True)
+
+
+def _goal_state(db: Any, session_id: str) -> Optional[dict[str, Any]]:
+    """The persisted goal for one session, parsed, or None when the session has none.
+
+    ``db.get_meta`` raises for an unreadable database (the caller counts that as a failed read);
+    a missing row, unparseable JSON and a non-object row are all "no goal", which is what makes the
+    card render no goal line.
+    """
+    raw = db.get_meta(f"{_GOAL_META_PREFIX}{session_id}")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        log.warning("goals: could not parse the stored goal for %s: %s", session_id, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _goal_gate(gate: dict[str, Any]) -> dict[str, Any]:
+    """One quality gate's state, without its output tail: the card's hover names the command."""
+    exit_code = gate.get("last_exit_code")
+    return {
+        "command": str(gate.get("command") or ""),
+        "attempts": _int(gate.get("attempts")),
+        "last_exit_code": None if exit_code is None else _int(exit_code),
+    }
+
+
+def _goal_row(data: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The card's goal row, or None when this session has no ACTIVE goal.
+
+    Hermes tracks completion for the goal as a whole (the judge's verdict), not per criterion, so
+    `subgoals_done` stays 0 while the goal is active: this route never invents progress the app
+    does not record. The gates are the machine-checked evidence and travel with the row.
+    """
+    if not isinstance(data, dict) or str(data.get("status", _GOAL_ACTIVE) or "") != _GOAL_ACTIVE:
+        return None
+    raw_subgoals = data.get("subgoals")
+    subgoals = ([item.strip() for item in raw_subgoals
+                 if isinstance(item, str) and item.strip()]
+                if isinstance(raw_subgoals, list) else [])
+    raw_gates = data.get("gates")
+    gates = ([_goal_gate(gate) for gate in raw_gates
+              if isinstance(gate, dict) and str(gate.get("command") or "").strip()]
+             if isinstance(raw_gates, list) else [])
+    updated = data.get("last_turn_at") or data.get("created_at") or 0
+    return {
+        "title": str(data.get("goal") or "").strip(),
+        "status": _GOAL_ACTIVE,
+        "turns_used": _int(data.get("turns_used")),
+        "max_turns": _int(data.get("max_turns") or _GOAL_DEFAULT_MAX_TURNS),
+        "subgoals": subgoals,
+        "subgoals_done": 0,
+        "gates": gates,
+        "updated_at": float(updated or 0.0),
+    }
+
+
+@router.get("/goals")
+def goals(session_ids: str = Query("", description="Comma separated session ids, capped at 60")
+          ) -> dict[str, Any]:
+    """The active goal on each of up to 60 sessions, in one read.
+
+    ``{"ok": true, "goals": {session_id: {title, status, turns_used, max_turns, subgoals,
+    subgoals_done, gates, updated_at}}}``. Only an ``active`` goal is included; a session with no
+    goal, a paused one, a done one and an unknown id are all simply absent, which is what makes the
+    card render no goal line. Ids that are not plain session-id shaped are dropped, not looked up.
+
+    ``ok: false, code: "goals_unavailable"`` is an unreadable state database (or every read failing),
+    never a 500: the Desktop shows one quiet note instead of a card-level error. A single session
+    that raises is skipped and the rest still answer.
+
+    ``def``, not ``async def``: each goal is a blocking SQLite meta read, so FastAPI must run this in
+    the threadpool rather than on the gateway event loop. Answers are cached 30 s under the sorted id
+    list.
+    """
+    ids = _goal_ids(session_ids)
+    if not ids:
+        return {"ok": True, "goals": {}}
+    key: tuple[Any, ...] = ("goals", tuple(sorted(ids)))
+    cached = _cache_hit(key)
+    if cached is not None:
+        return cached
+    try:
+        db = _goal_db()
+    except Exception as exc:
+        log.warning("goals: the Hermes state database is unavailable: %s", exc)
+        return {"ok": False, "code": "goals_unavailable",
+                "error": "Goal status is unavailable because this Hermes build has no readable "
+                         "state database."}
+    found: dict[str, Any] = {}
+    failures = 0
+    try:
+        for session_id in ids:
+            try:
+                row = _goal_row(_goal_state(db, session_id))
+            except Exception as exc:  # one unreadable session must not blank the whole board
+                failures += 1
+                log.debug("goals: %s could not be read: %s", session_id, exc)
+                continue
+            if row is not None:
+                found[session_id] = row
+    finally:
+        try:
+            db.close()
+        except Exception:  # a read-only handle that cannot close is already spent
+            log.debug("goals: the read-only state.db handle did not close cleanly", exc_info=True)
+    if failures == len(ids):
+        # Nothing could be read: answering "no goals" here would be a lie the UI believes.
+        log.warning("goals: every goal read failed (%d sessions)", failures)
+        return {"ok": False, "code": "goals_unavailable",
+                "error": "Goal status is unavailable because no session goal could be read."}
+    payload = {"ok": True, "goals": found}
+    _cache_put(key, payload, ttl=GOALS_TTL)
+    return payload
+
+
+# --- Archived sessions -------------------------------------------------------
+#
+# `session.list` reads `list_sessions_rich` without `archived_only`, so an archived session is
+# absent from EVERY board row. That is not a rare state on a working machine: one store here holds
+# 1,929 archived sessions out of 2,010, and from the Desktop that reads as sessions vanishing. The
+# gateway method exposes no archived flag (`include_hidden` is a different flag), so the plugin
+# reads its own state database through the same published `hermes_state` surface the goals read
+# uses. This is the ONLY route here that answers for rows the gateway will not list.
+
+ARCHIVED_MAX = 300
+ARCHIVED_TTL = 30
+
+
+@router.get("/sessions/archived")
+def sessions_archived(limit: int = Query(ARCHIVED_MAX, ge=1, le=ARCHIVED_MAX)) -> dict[str, Any]:
+    """Archived sessions, newest first, plus the real total.
+
+    ``{"ok": true, "total": 1929, "sessions": [{id, title, source, cwd, git_branch, started_at,
+    last_active, message_count}]}``. ``total`` is the count of every archived session, not
+    ``len(sessions)``, so the indicator can say "the newest 300 of 1,929" instead of quietly
+    reporting the cap as the truth.
+
+    ``ok: false`` with ``sessions_unavailable`` is an unreadable state database, never a 500 and
+    never an empty success: the caller renders a sentence, not a confident zero.
+
+    ``def``, not ``async def``: this is a blocking SQLite read, so FastAPI must run it in the
+    threadpool rather than on the gateway event loop. One handle per request, closed in the
+    ``finally``, cached 30 s.
+    """
+    key: tuple[Any, ...] = ("sessions", "archived", limit)
+    cached = _cache_hit(key)
+    if cached is not None:
+        return cached
+    try:
+        db = _goal_db()
+    except Exception as exc:
+        log.warning("sessions: the Hermes state database is unavailable: %s", exc)
+        return {"ok": False, "code": "sessions_unavailable",
+                "error": "Archived sessions are unavailable because this Hermes build has no "
+                         "readable state database."}
+    try:
+        rows = db.list_sessions_rich(archived_only=True, compact_rows=True, limit=limit,
+                                     order_by_last_active=True)
+        total = int(db.session_count(archived_only=True))
+    except Exception as exc:
+        log.warning("sessions: archived listing failed: %s", exc)
+        return {"ok": False, "code": "sessions_unavailable",
+                "error": f"Archived sessions could not be read: {type(exc).__name__}."}
+    finally:
+        try:
+            db.close()
+        except Exception:  # a read-only handle that cannot close is already spent
+            log.debug("sessions: the read-only state.db handle did not close cleanly", exc_info=True)
+    sessions = []
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        sessions.append({
+            "id": str(row.get("id")),
+            "title": str(row.get("title") or ""),
+            "source": str(row.get("source") or ""),
+            "cwd": str(row.get("cwd") or ""),
+            "git_branch": str(row.get("git_branch") or ""),
+            "started_at": row.get("started_at"),
+            "last_active": row.get("last_active"),
+            "message_count": _int(row.get("message_count")),
+        })
+    payload = {"ok": True, "total": total, "sessions": sessions}
+    _cache_put(key, payload, ttl=ARCHIVED_TTL)
+    return payload
+
+
 # --- Board state -------------------------------------------------------------
 #
 # The rows live in board_store.py's SQLite file; nothing about the board is cached here. The module
@@ -4097,9 +4626,14 @@ def _auto_link(store: Any, session_id: Optional[str]) -> dict[str, Any]:
     elif link and (link.get("project_id") or "") == resolved:
         via = "session_link"
     else:
-        via = "cwd_prefix"
+        # `resolve_agent_cwd()` answers this process's own folder. Under
+        # `hermes serve` that is the gateway's cwd, not the asking session's, so
+        # this match is a server-side guess and the name says so: no caller may
+        # read it as the session's folder.
+        via = "server_cwd"
     # The same rule the renderer applies: the session's own lane wins, else the project's.
-    lane = store.resolve_lane(link, store.get_status(resolved) if resolved else None)
+    lane = store.resolve_lane(link, store.get_status(resolved) if resolved else None,
+                              store.lane_ids())
     return {"session_id": session_id or "", "project_id": resolved, "via": via, "cwd": cwd,
             "lane": lane}
 
@@ -4156,6 +4690,70 @@ def board_status(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
                              source="user")
         else:
             _broadcast_board("status", project_id, status=result["status"]["status"], source="user")
+    return result
+
+
+@router.get("/board/lanes")
+def board_lanes() -> dict[str, Any]:
+    """Every lane definition, sorted by position: ``{id, label, order, custom, system}``.
+
+    Lanes are board data now, not a constant: the Desktop renames, reorders and adds them through
+    the two routes below, and every write path validates against the same table. The seven seeded
+    rows are ``system`` lanes (``unfiled`` through ``canceled``); they can be renamed and moved but
+    not deleted. A broken database is ``ok: false, code: store_error`` with an empty list.
+    """
+    try:
+        return {"ok": True, "lanes": _board_store().lanes()}
+    except Exception as exc:
+        return _board_failure(exc, lanes=[])
+
+
+@router.post("/board/lanes")
+def board_lane(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Create a lane, or rename and/or move one. Body ``{id?, label, order?}``.
+
+    Without ``id`` the id is a slug of ``label`` (a duplicate is ``code: lane_exists``, a label that
+    cannot yield an id is ``code: bad_label``) and the lane is custom and appended unless ``order``
+    is given. With ``id`` an unknown lane is ``code: unknown_lane``. Always HTTP 200.
+    """
+    try:
+        result = _board_store().save_lane(
+            payload.get("id"), payload.get("label"), payload.get("order"))
+    except Exception as exc:
+        return _board_failure(exc)
+    if result.get("ok"):
+        _broadcast_board("lanes", None, source="user")
+    return result
+
+
+@router.post("/board/lanes/order")
+def board_lanes_order(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Reorder lanes: body ``{ids: [...]}`` must be a permutation of the live ids (else
+    ``code: bad_order``). Positions are rewritten ``0..n-1`` in the order given."""
+    try:
+        result = _board_store().reorder_lanes(payload.get("ids"))
+    except Exception as exc:
+        return _board_failure(exc)
+    if result.get("ok"):
+        _broadcast_board("lanes", None, source="user")
+    return result
+
+
+@router.post("/board/lanes/delete")
+def board_lane_delete(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Delete a custom lane: body ``{id, reassign?}``.
+
+    A system lane is ``code: system_lane`` (rename or reorder it instead), the last lane is
+    ``code: last_lane`` and an unknown id is ``code: unknown_lane``. A lane that project statuses
+    or session links still hold is ``code: lane_in_use`` with the counts unless ``reassign`` names
+    another live lane; with it those rows move in the same transaction.
+    """
+    try:
+        result = _board_store().delete_lane(payload.get("id"), payload.get("reassign"))
+    except Exception as exc:
+        return _board_failure(exc)
+    if result.get("ok"):
+        _broadcast_board("lanes", None, source="user")
     return result
 
 

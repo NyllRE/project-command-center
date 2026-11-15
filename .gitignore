@@ -4,3 +4,6 @@ __pycache__/
 
 # Test runs keep their throwaway Hermes home here
 tests/.tmp/
+
+# Local worktrees live inside the repo, never in the index.
+.worktrees/

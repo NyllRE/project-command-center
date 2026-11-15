@@ -10,7 +10,7 @@ the status the board shows after the next ``board.changed`` event.
   * ``pcc_work_item``   attach or detach the issue or PR the current session works on.
 
 ``hooks.py`` holds the two agent hooks registered alongside the tools: ``pre_llm_call`` injects a
-<= 400 character card summary into the turn, and ``post_tool_call`` records the PR a terminal
+<= ``MAX_CONTEXT`` character card summary into the turn, and ``post_tool_call`` records the PR a terminal
 ``gh pr create`` opened (unless ``auto_link.off`` sits in the plugin's data directory). Neither
 hook reaches the network or starts a process; both read and write the same local store.
 
@@ -36,7 +36,7 @@ from typing import Any, Callable, Optional
 log = logging.getLogger(__name__)
 
 PLUGIN_NAME = "project-command-center"
-PLUGIN_VERSION = "0.4.2"
+PLUGIN_VERSION = "0.5.0"
 TOOLSET = "project_command_center"
 
 _STORE_LOCK = threading.Lock()
