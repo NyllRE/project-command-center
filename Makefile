@@ -26,4 +26,4 @@ test-py:
 	@set -e; for suite in $(PY_SUITES); do printf "%-22s " "$$suite"; $(PYTHON) tests/$$suite.py >/tmp/pcc-$$suite.log 2>&1 && echo ok || { echo FAILED; tail -20 /tmp/pcc-$$suite.log; exit 1; }; done
 
 test-js:
-	@node --test tests/graph_layout.test.mjs tests/github_status.test.mjs tests/session_lane.test.mjs tests/plugin_surface.test.mjs
+	@node --test tests/graph_layout.test.mjs tests/github_status.test.mjs tests/github_filter.test.mjs tests/session_lane.test.mjs tests/plugin_surface.test.mjs

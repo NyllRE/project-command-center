@@ -64,6 +64,8 @@ const TREE_MS = 15000
 const LIVE_MS = 5000
 const STATUS_KEY = 'projectStatus.v1'
 const SORT_KEY = 'projectSort.v1'
+// The board's GitHub-only checkbox: off by default, remembered afterwards.
+const GITHUB_ONLY_KEY = 'projectGithubOnly.v1'
 const OPEN_KEY = 'openProject.v1'
 const BOARD_CARD_LIMIT = 5
 const COLUMN_WIDTH = 340
@@ -657,6 +659,87 @@ function useProjectSync(projects) {
   }, [sig, live])
 }
 
+// ── github-only filter ───────────────────────────────────────────────────────
+// A project is "on GitHub" when ANY folder it owns carries a github.com remote.
+// The board reads that from the existing /repo route, which is local git only:
+// no token, no gh CLI, no network. Everything here is pure so the marker block
+// can be sliced out and exercised without a browser.
+// github-filter:begin
+const GITHUB_PROBE_LIMIT = 50
+
+function projectFolderPaths(project) {
+  const seen = new Set()
+  const out = []
+
+  const push = value => {
+    const text = String(value || '').trim()
+
+    if (text && !seen.has(text)) {
+      seen.add(text)
+      out.push(text)
+    }
+  }
+
+  if (!project) return out
+  push(project.path)
+  for (const repo of project.repos || []) push(repo && repo.path)
+  for (const folder of project.folders || []) push(typeof folder === 'string' ? folder : folder && folder.path)
+
+  return out
+}
+
+// Every folder worth asking about, one entry per path, capped so a board of
+// many multi-folder projects stays one bounded round of requests.
+function githubProbePaths(projects, limit) {
+  const cap = Number.isFinite(limit) ? limit : GITHUB_PROBE_LIMIT
+  const seen = new Set()
+
+  for (const project of projects || []) {
+    for (const path of projectFolderPaths(project)) {
+      if (seen.size >= cap) return Array.from(seen)
+      seen.add(path)
+    }
+  }
+
+  return Array.from(seen)
+}
+
+// A git remote that GitHub serves. Covers https, ssh:// and the scp-style
+// `git@github.com:owner/repo` form, and rejects a lookalike host.
+function isGithubRemote(remote) {
+  return /(^|@|\/\/)github\.com[:/]/i.test(String(remote || ''))
+}
+
+// Project ids with at least one GitHub folder. `remoteByPath` is the probe
+// answer: path → remote url ('' when the folder has no remote or no git).
+function githubProjectIds(projects, remoteByPath) {
+  const ids = new Set()
+
+  if (!remoteByPath) return ids
+  for (const project of projects || []) {
+    if (!project || !project.id) continue
+    for (const path of projectFolderPaths(project)) {
+      if (isGithubRemote(remoteByPath[path])) {
+        ids.add(project.id)
+        break
+      }
+    }
+  }
+
+  return ids
+}
+
+// `linkedIds` is null while the probe has not answered: the filter then shows
+// every project. A filter must never hide the board because a read was slow.
+function filterProjectsByGithub(projects, linkedIds, on) {
+  const list = projects || []
+
+  if (!on || !linkedIds) return list
+
+  return list.filter(project => Boolean(project && linkedIds.has(project.id)))
+}
+// github-filter:end
+
 // ── sort storage ─────────────────────────────────────────────────────────────
 
 const $sort = atom(DEFAULT_SORT)
@@ -671,6 +754,23 @@ function writeSort(sortId) {
   if (!SORTS.some(s => s.id === sortId)) return
   $sort.set(sortId)
   if (pluginCtx) pluginCtx.storage.set(SORT_KEY, sortId)
+}
+
+// ── github-only storage ──────────────────────────────────────────────────────
+// Same discipline as sort: the atom is the render path, ctx.storage the durable
+// copy. Off unless the user turned it on, and their choice survives a restart.
+
+const $githubOnly = atom(false)
+
+function readGithubOnly() {
+  return pluginCtx ? pluginCtx.storage.get(GITHUB_ONLY_KEY, false) === true : false
+}
+
+function writeGithubOnly(on) {
+  const next = on === true
+
+  $githubOnly.set(next)
+  if (pluginCtx) pluginCtx.storage.set(GITHUB_ONLY_KEY, next)
 }
 
 // ── open project storage ─────────────────────────────────────────────────────
@@ -937,6 +1037,17 @@ const S = {
   count: { fontSize: '0.75rem', color: 'var(--ui-text-quaternary)', fontVariantNumeric: 'tabular-nums' },
   grow: { flex: '1 1 0', minWidth: 0 },
   searchWrap: { width: 300, maxWidth: '100%', flex: '0 1 300px' },
+  githubOnly: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 6,
+    fontSize: '0.75rem',
+    color: 'var(--ui-text-secondary)',
+    cursor: 'pointer',
+    userSelect: 'none',
+    whiteSpace: 'nowrap'
+  },
+  githubOnlyBox: { margin: 0, cursor: 'pointer', width: 12, height: 12 },
   boardWrap: { position: 'relative', flex: '1 1 0', minHeight: 0, display: 'flex' },
   scroller: {
     display: 'flex',
@@ -2217,6 +2328,48 @@ function useRepoCounts(projects) {
   const data = query.data
 
   return data && data.ok && data.counts && typeof data.counts === 'object' ? data.counts : NO_COUNTS
+}
+
+// Which projects own a github.com remote. One /repo read per folder, all in
+// flight together, cached by TanStack and by the route itself. Null until the
+// first answer lands, which is what keeps the filter fail-open on a cold read
+// or a backend that predates the route.
+function useGithubLinked(projects) {
+  const paths = useMemo(() => githubProbePaths(projects), [projects])
+  const key = paths.join('\n')
+
+  const query = useQuery({
+    enabled: key !== '',
+    queryFn: async () => {
+      let answered = 0
+      const rows = await Promise.all(
+        paths.map(path =>
+          ghRest(`/repo?path=${encodeURIComponent(path)}`)
+            .then(payload => {
+              answered += 1
+
+              return [path, payload && typeof payload.remote === 'string' ? payload.remote : '']
+            })
+            .catch(() => [path, ''])
+        )
+      )
+
+      // Nothing answered: the connection state is unknown, not "no repos".
+      if (answered === 0) return null
+
+      const remoteByPath = {}
+
+      for (const [path, remote] of rows) remoteByPath[path] = remote
+
+      return remoteByPath
+    },
+    queryKey: [QUERY_ROOT, 'gh-linked', key],
+    refetchInterval: 60000,
+    retry: false,
+    staleTime: 60000
+  })
+
+  return useMemo(() => (query.data ? githubProjectIds(projects, query.data) : null), [projects, query.data])
 }
 
 function countOf(value) {
@@ -7273,8 +7426,15 @@ function ProjectsPage() {
 
   const q = search.trim().toLowerCase()
   const sortId = useValue($sort)
+  const githubOnly = useValue($githubOnly)
   const filtered = useMemo(() => (q ? projects.filter(p => matchesQuery(p, q)) : projects), [projects, q])
-  const visible = useMemo(() => sortProjects(filtered, sortId, statuses), [filtered, sortId, statuses])
+  // Null until the probe answers, which keeps a slow read from hiding rows.
+  const githubLinked = useGithubLinked(projects)
+  const narrowed = useMemo(
+    () => filterProjectsByGithub(filtered, githubLinked, githubOnly),
+    [filtered, githubLinked, githubOnly]
+  )
+  const visible = useMemo(() => sortProjects(narrowed, sortId, statuses), [narrowed, sortId, statuses])
 
   // The 15s background poll also sets isFetching, so the glyph would spin on its
   // own. Spin only for a click.
@@ -7287,7 +7447,7 @@ function ProjectsPage() {
   }
 
   const fetching = spin
-  const countLabel = q ? `${visible.length} of ${projects.length}` : String(projects.length)
+  const countLabel = q || githubOnly ? `${visible.length} of ${projects.length}` : String(projects.length)
 
   let board
 
@@ -7303,11 +7463,21 @@ function ProjectsPage() {
       })
     })
   } else if (visible.length === 0) {
+    const githubEmpty = !q && githubOnly && projects.length > 0
+
     board = jsx('div', {
       style: { flex: '1 1 0', display: 'grid', placeItems: 'center' },
       children: jsx(EmptyState, {
-        description: q ? 'Try a different name, folder or branch.' : 'Projects appear here once a session runs inside a folder.',
-        title: q ? `No projects match \u201c${search.trim()}\u201d` : 'No projects yet'
+        description: q
+          ? 'Try a different name, folder or branch.'
+          : githubEmpty
+            ? 'Uncheck "GitHub only" to see every project again.'
+            : 'Projects appear here once a session runs inside a folder.',
+        title: q
+          ? `No projects match \u201c${search.trim()}\u201d`
+          : githubEmpty
+            ? 'No GitHub-connected projects'
+            : 'No projects yet'
       })
     })
   } else {
@@ -7345,6 +7515,19 @@ function ProjectsPage() {
           jsx('h1', { style: S.title, children: 'Projects' }),
           jsx('span', { style: S.count, children: tree.data ? `${countLabel} ${projects.length === 1 && !q ? 'project' : 'projects'}` : '' }),
           jsx('span', { style: S.grow }),
+          jsxs('label', {
+            style: S.githubOnly,
+            title: 'Show only projects with a github.com remote',
+            children: [
+              jsx('input', {
+                checked: githubOnly,
+                onChange: event => writeGithubOnly(event.target.checked),
+                style: S.githubOnlyBox,
+                type: 'checkbox'
+              }),
+              jsx('span', { children: 'GitHub only' })
+            ]
+          }),
           jsx(SortPicker, { sort: sortId }),
           jsx('div', {
             style: S.searchWrap,
@@ -7418,6 +7601,7 @@ export default {
     }
     $statuses.set(readStatuses())
     $sort.set(readSort())
+    $githubOnly.set(readGithubOnly())
     $ghPreset.set(readGhPreset())
     $openProject.set(readOpenProject())
 
